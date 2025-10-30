@@ -21,6 +21,7 @@ BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "")
 APP_BASE_URL: Final[str] = os.getenv("APP_BASE_URL", "").rstrip("/")
 WEBHOOK_SECRET: Final[str] = os.getenv("WEBHOOK_SECRET", "")
 
+# Админ, кому шлём заявки
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7039409310") or 7039409310)
 
 if not BOT_TOKEN:
@@ -34,14 +35,14 @@ logger = logging.getLogger("tgbot")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ================== CONSTANTS ==================
+# ================== ТАРИФЫ (₽/км) ==================
 TARIFFS = {
     "econom":  {"title": "Легковой", "per_km": 30},
     "camry":   {"title": "Camry",    "per_km": 40},
     "minivan": {"title": "Минивэн",  "per_km": 50},
 }
 
-# ================== KEYBOARDS ==================
+# ================== КЛАВИАТУРЫ ==================
 def start_big_button_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="▶️ Старт")]],
@@ -61,34 +62,38 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     )
 
 def dispatcher_inline_kb() -> InlineKeyboardMarkup:
-    # на мобильных Telegram корректно открывает набор номера по tel:
+    # Одна кликабельная кнопка: откроет звонок (на мобильных клиентах Telegram)
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Позвонить диспетчеру", url="tel:+79340241414")
+        InlineKeyboardButton(
+            text="📞 Позвонить диспетчеру +7 934 024-14-14",
+            url="tel:+79340241414"
+        )
     ]])
 
 def confirm_order_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить", callback_data="order_confirm"),
-        InlineKeyboardButton(text="✏️ Изменить", callback_data="order_edit"),
-        InlineKeyboardButton(text="❌ Отменить", callback_data="order_cancel"),
+        InlineKeyboardButton(text="✏️ Изменить",    callback_data="order_edit"),
+        InlineKeyboardButton(text="❌ Отменить",    callback_data="order_cancel"),
     ]])
 
-# ================== STATES ==================
+# ================== СОСТОЯНИЯ ==================
 class CalcStates(StatesGroup):
     from_city = State()
-    to_city = State()
+    to_city   = State()
 
 class OrderStates(StatesGroup):
     from_city = State()
-    to_city = State()
-    date = State()
-    time = State()
-    phone = State()
-    comment = State()
-    confirm = State()
+    to_city   = State()
+    date      = State()
+    time      = State()
+    phone     = State()
+    comment   = State()
+    confirm   = State()
 
-# ================== HELPERS ==================
+# ================== ХЕЛПЕРЫ ==================
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    # расстояние по сфере (км)
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -97,13 +102,9 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
 async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Dict[str, float]]:
-    # Nominatim требует User-Agent
+    # Геокодим город через Nominatim (OSM)
     url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": city,
-        "format": "json",
-        "limit": 1,
-    }
+    params = {"q": city, "format": "json", "limit": 1}
     headers = {"User-Agent": "TransferAir-KMV-TelegramBot/1.0 (contact: admin@example.com)"}
     try:
         async with session.get(url, params=params, headers=headers, timeout=20) as r:
@@ -118,8 +119,11 @@ async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Di
         logger.warning("Geocode failed for %s: %s", city, e)
         return None
 
-def format_prices_km(distance_km: float) -> str:
-    d = round(distance_km, 1)
+def normalize_city(text: str) -> str:
+    return " ".join(text.strip().split())
+
+def prices_block(distance_km: float) -> str:
+    d = max(1.0, round(distance_km, 1))  # минимум 1 км
     p_e = int(round(d * TARIFFS["econom"]["per_km"]))
     p_c = int(round(d * TARIFFS["camry"]["per_km"]))
     p_m = int(round(d * TARIFFS["minivan"]["per_km"]))
@@ -131,21 +135,18 @@ def format_prices_km(distance_km: float) -> str:
         f"• Минивэн — ~{p_m} ₽ (50 ₽/км)"
     )
 
-def normalize_city(text: str) -> str:
-    return " ".join(text.strip().split())
-
 PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{8,}$")
 
-# ================== HANDLERS ==================
+# ================== ХЕНДЛЕРЫ ==================
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    # "центр" в Telegram нельзя задать, сделаем визуально с пустыми строками
+    # визуально "центр": пустые строки + крупная кнопка Старт
     text = (
         " \n"
         " \n"
-        "*Здравствуйте!*\n"
-        "Это бот междугороднего такси\n"
+        "*Здравствуйте!* \n"
+        "Это бот междугороднего такси \n"
         "*TransferAir Кавказские Минеральные Воды*.\n"
         " \n"
         "Нажмите *Старт*, чтобы продолжить."
@@ -160,18 +161,19 @@ async def on_big_start(message: Message, state: FSMContext):
 # ---- ДИСПЕТЧЕР ----
 @dp.message(F.text == "☎️ Диспетчер")
 async def on_dispatcher(message: Message):
-    await message.answer("Связаться с диспетчером: +7 934 024-14-14",
-                         reply_markup=main_menu_kb())
-    await message.answer("Нажмите кнопку ниже, чтобы позвонить:",
-                         reply_markup=None)
-    await bot.send_message(message.chat.id, "☎️", reply_markup=dispatcher_inline_kb())
+    text = (
+        "☎️ *Связаться с диспетчером*\n\n"
+        "[Позвонить по номеру +7 934 024-14-14](tel:+79340241414)\n\n"
+        "Нажмите кнопку ниже, чтобы совершить звонок:"
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=dispatcher_inline_kb())
 
 # ---- КАЛЬКУЛЯТОР ----
 @dp.message(F.text == "🧮 Калькулятор стоимости")
 async def calc_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(CalcStates.from_city)
-    await message.answer("Введите *город отправления*:", parse_mode="Markdown", reply_markup=main_menu_kb())
+    await message.answer("Введите *город отправления*:", parse_mode="Markdown")
 
 @dp.message(CalcStates.from_city, F.text)
 async def calc_from_city(message: Message, state: FSMContext):
@@ -189,28 +191,24 @@ async def calc_to_city(message: Message, state: FSMContext):
     data = await state.get_data()
     from_city = data.get("from_city")
 
-    # геокодим обе точки и считаем км
     async with aiohttp.ClientSession() as session:
         a = await geocode_city(session, from_city)
         b = await geocode_city(session, to_city)
 
     if not a or not b:
         await message.answer(
-            "Не удалось определить один из городов. Попробуйте указать полное название (например: "
+            "Не удалось определить один из городов. Укажите полное название (например: "
             "`Кисловодск`, `Ставрополь`, `Минеральные Воды`).",
             parse_mode="Markdown"
         )
         return
 
     dist = haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
-    # очень грубо, но для межгорода ок; минимум 1 км
-    dist = max(dist, 1.0)
-
     txt = (
-        f"🧮 Калькулятор стоимости\n\n"
+        f"🧮 *Калькулятор стоимости*\n\n"
         f"Из: *{from_city}*\n"
         f"В: *{to_city}*\n\n"
-        f"{format_prices_km(dist)}"
+        f"{prices_block(dist)}"
     )
     await message.answer(txt, parse_mode="Markdown", reply_markup=main_menu_kb())
     await state.clear()
@@ -291,7 +289,6 @@ async def order_comment(message: Message, state: FSMContext):
     data = await state.get_data(); order = data.get("order", {})
     order["comment"] = comment
 
-    # Подтверждение
     txt = (
         "Проверьте данные заказа:\n\n"
         f"Город отправления: *{order['from_city']}*\n"
@@ -316,7 +313,6 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
         return
 
     if action == "order_edit":
-        # простой вариант: начать заново
         await state.clear()
         await cb.message.edit_text("Изменим заказ. Заполните ещё раз, пожалуйста.")
         await bot.send_message(cb.message.chat.id, "Город *отправления*:", parse_mode="Markdown")
@@ -329,7 +325,7 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
     order = data.get("order", {})
     await state.clear()
 
-    await cb.message.edit_text("✅ Спасибо, Ваша заявка принята!\nВ ближайшее время с Вами свяжется диспетчер.")
+    await cb.message.edit_text("✅ Спасибо, Ваша заявка принята!\nВ ближайшее время с Вами свяжется диспетчер!")
     await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
     await cb.answer("Заявка отправлена")
 
@@ -377,9 +373,7 @@ async def _set_webhook_with_retry():
     url = f"{APP_BASE_URL}/webhook/{WEBHOOK_SECRET or ''}".rstrip("/")
     while True:
         try:
-            await bot.set_my_commands([
-                BotCommand(command="start", description="Запуск"),
-            ])
+            await bot.set_my_commands([BotCommand(command="start", description="Запуск")])
             await bot.set_webhook(
                 url=url,
                 secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
