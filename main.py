@@ -1,70 +1,89 @@
 import os
+import asyncio
 import logging
+from typing import Final
+
 from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
 from aiogram.types import Update, Message, BotCommand
-from dotenv import load_dotenv
+from aiogram.filters import CommandStart
 
-logging.basicConfig(level=logging.INFO)
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_BASE_URL = os.getenv("APP_BASE_URL")  # e.g. https://your-app.dockhost.ru
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change_me_secret")
+# ---------- Конфиг из переменных окружения ----------
+BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "")
+APP_BASE_URL: Final[str] = os.getenv("APP_BASE_URL", "").rstrip("/")
+WEBHOOK_SECRET: Final[str] = os.getenv("WEBHOOK_SECRET", "")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN in environment")
-if not APP_BASE_URL:
-    raise RuntimeError("Missing APP_BASE_URL in environment")
+    raise RuntimeError("BOT_TOKEN is not set")
 
-bot = Bot(BOT_TOKEN)
+# ---------- Логирование ----------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger("tgbot")
+
+# ---------- Aiogram ----------
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 @dp.message(CommandStart())
-async def start(msg: Message):
-    await msg.answer("Привет! Я работаю через webhook 24/7 🤖")
+async def on_start(message: Message):
+    await message.answer("Бот запущен! ✨")
 
-@dp.message(Command("help"))
-async def help_cmd(msg: Message):
-    await msg.answer("Это webhook-бот на aiogram 3 + FastAPI.")
+@dp.message(F.text == "/help")
+async def on_help(message: Message):
+    await message.answer("Команды: /start, /help")
 
-@dp.message(F.text)
-async def echo(msg: Message):
-    await msg.reply(msg.text)
-
+# ---------- FastAPI ----------
 app = FastAPI()
 
-@app.on_event("startup")
-async def on_startup():
-    commands = [
-        BotCommand(command="start", description="Запустить бота"),
-        BotCommand(command="help", description="Помощь"),
-    ]
-    await bot.set_my_commands(commands)
+@app.get("/")
+async def healthcheck():
+    return {"status": "ok"}
 
-    url = APP_BASE_URL.rstrip("/") + "/webhook/" + WEBHOOK_SECRET
-    await bot.set_webhook(
-        url=url,
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True,
-    )
-    logging.info("Webhook set to %s", url)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await bot.delete_webhook(drop_pending_updates=False)
-    logging.info("Webhook removed")
-
-@app.post("/webhook/{token}")
-async def telegram_webhook(request: Request, token: str):
-    if token != WEBHOOK_SECRET:
+@app.post(f"/webhook/{{secret}}")
+async def telegram_webhook(secret: str, request: Request):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
     data = await request.json()
     update = Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-@app.get("/")
-async def root():
-    return {"status": "ok"}
+# ----- Фоновая установка вебхука с ретраями -----
+async def _set_webhook_with_retry():
+    if not APP_BASE_URL:
+        logger.warning("APP_BASE_URL не задан — вебхук не будет установлен")
+        return
+
+    url = f"{APP_BASE_URL}/webhook/{WEBHOOK_SECRET or ''}".rstrip("/")
+    while True:
+        try:
+            await bot.set_my_commands([
+                BotCommand(command="start", description="Запуск"),
+                BotCommand(command="help", description="Помощь"),
+            ])
+
+            await bot.set_webhook(
+                url=url,
+                secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+                drop_pending_updates=True,
+            )
+            logger.info("Webhook set to %s", url)
+            break
+        except Exception as e:
+            logger.warning("Webhook not set yet (%s). Retrying soon…", e)
+            # Повторная попытка чуть позже
+            await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def on_startup():
+    # запускаем фоновую задачу, чтобы не падать, если домен еще не готов
+    asyncio.create_task(_set_webhook_with_retry())
+    logger.info("Startup complete. HTTP server is up; waiting for webhook setup…")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Webhook removed")
+    except Exception as e:
+        logger.warning("Failed to delete webhook: %s", e)
