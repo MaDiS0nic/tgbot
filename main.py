@@ -2,7 +2,8 @@ import os
 import math
 import asyncio
 import logging
-from typing import Final, Dict, Any
+import re
+from typing import Final, Dict, Any, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, F
@@ -13,13 +14,13 @@ from aiogram.types import (
 )
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+import aiohttp
 
 # ================== CONFIG ==================
 BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "")
 APP_BASE_URL: Final[str] = os.getenv("APP_BASE_URL", "").rstrip("/")
 WEBHOOK_SECRET: Final[str] = os.getenv("WEBHOOK_SECRET", "")
 
-# твой админ-ID:
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7039409310") or 7039409310)
 
 if not BOT_TOKEN:
@@ -33,15 +34,7 @@ logger = logging.getLogger("tgbot")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ================== FSM STATES ==================
-class OrderStates(StatesGroup):
-    waiting_from = State()
-    waiting_to = State()
-    waiting_distance_km = State()
-    choose_tariff = State()
-    confirm = State()
-
-# ================== TARIFFS (₽/км) ==================
+# ================== CONSTANTS ==================
 TARIFFS = {
     "econom":  {"title": "Легковой", "per_km": 30},
     "camry":   {"title": "Camry",    "per_km": 40},
@@ -49,49 +42,50 @@ TARIFFS = {
 }
 
 # ================== KEYBOARDS ==================
+def start_big_button_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="▶️ Старт")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="🧮 Калькулятор стоимости")],
             [KeyboardButton(text="📝 Сделать заказ")],
-            [KeyboardButton(text="ℹ️ Тарифы"), KeyboardButton(text="☎️ Поддержка")],
+            [KeyboardButton(text="☎️ Диспетчер")],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
-def share_location_kb(prompt_text: str) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=prompt_text, request_location=True)],
-            [KeyboardButton(text="Пропустить и ввести адрес")],
-            [KeyboardButton(text="⬅️ Назад в меню")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+def dispatcher_inline_kb() -> InlineKeyboardMarkup:
+    # на мобильных Telegram корректно открывает набор номера по tel:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Позвонить диспетчеру", url="tel:+79340241414")
+    ]])
 
-def back_menu_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="⬅️ Назад в меню")]],
-        resize_keyboard=True,
-    )
+def confirm_order_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data="order_confirm"),
+        InlineKeyboardButton(text="✏️ Изменить", callback_data="order_edit"),
+        InlineKeyboardButton(text="❌ Отменить", callback_data="order_cancel"),
+    ]])
 
-def tariffs_inline_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="Легковой (30 ₽/км)", callback_data="tariff:econom")],
-        [InlineKeyboardButton(text="Camry (40 ₽/км)",    callback_data="tariff:camry")],
-        [InlineKeyboardButton(text="Минивэн (50 ₽/км)",  callback_data="tariff:minivan")],
-        [InlineKeyboardButton(text="⬅️ Отменить",        callback_data="cancel")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+# ================== STATES ==================
+class CalcStates(StatesGroup):
+    from_city = State()
+    to_city = State()
 
-def confirm_inline_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm:yes"),
-            InlineKeyboardButton(text="❌ Отменить",    callback_data="confirm:no"),
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+class OrderStates(StatesGroup):
+    from_city = State()
+    to_city = State()
+    date = State()
+    time = State()
+    phone = State()
+    comment = State()
+    confirm = State()
 
 # ================== HELPERS ==================
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -102,211 +96,263 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dphi/2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb/2) ** 2
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
-def estimate_price(distance_km: float, tariff_key: str) -> Dict[str, Any]:
-    per_km = TARIFFS[tariff_key]["per_km"]
-    price = int(round(max(distance_km, 0) * per_km))
-    return {"distance_km": round(distance_km, 2), "price": price}
+async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Dict[str, float]]:
+    # Nominatim требует User-Agent
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": city,
+        "format": "json",
+        "limit": 1,
+    }
+    headers = {"User-Agent": "TransferAir-KMV-TelegramBot/1.0 (contact: admin@example.com)"}
+    try:
+        async with session.get(url, params=params, headers=headers, timeout=20) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            if not data:
+                return None
+            lat = float(data[0]["lat"]); lon = float(data[0]["lon"])
+            return {"lat": lat, "lon": lon}
+    except Exception as e:
+        logger.warning("Geocode failed for %s: %s", city, e)
+        return None
 
-def fmt_order_summary(data: dict) -> str:
-    parts = []
-    parts.append("🚕 *Новый заказ*")
-    parts.append(f"Тариф: *{TARIFFS[data['tariff']]['title']}*")
-    parts.append(f"Откуда: {data.get('from_text', '—')}")
-    parts.append(f"Куда: {data.get('to_text', '—')}")
-    if "from_geo" in data and "to_geo" in data:
-        fgeo = data["from_geo"]; tgeo = data["to_geo"]
-        parts.append(f"Гео откуда: {fgeo['lat']:.5f},{fgeo['lon']:.5f}")
-        parts.append(f"Гео куда: {tgeo['lat']:.5f},{tgeo['lon']:.5f}")
-    if "calc" in data:
-        c = data["calc"]
-        parts.append(f"Расстояние: ~{c['distance_km']} км")
-        parts.append(f"Цена: *~{c['price']} ₽*")
-    return "\n".join(parts)
+def format_prices_km(distance_km: float) -> str:
+    d = round(distance_km, 1)
+    p_e = int(round(d * TARIFFS["econom"]["per_km"]))
+    p_c = int(round(d * TARIFFS["camry"]["per_km"]))
+    p_m = int(round(d * TARIFFS["minivan"]["per_km"]))
+    return (
+        f"Расстояние: ~{d} км\n\n"
+        f"💰 Стоимость:\n"
+        f"• Легковой — ~{p_e} ₽ (30 ₽/км)\n"
+        f"• Camry — ~{p_c} ₽ (40 ₽/км)\n"
+        f"• Минивэн — ~{p_m} ₽ (50 ₽/км)"
+    )
+
+def normalize_city(text: str) -> str:
+    return " ".join(text.strip().split())
+
+PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{8,}$")
 
 # ================== HANDLERS ==================
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "Привет! Я помогу оформить заказ такси 🚕\nВыбери действие:",
-        reply_markup=main_menu_kb(),
-    )
-
-@dp.message(F.text == "ℹ️ Тарифы")
-async def on_tariffs(message: Message):
+    # "центр" в Telegram нельзя задать, сделаем визуально с пустыми строками
     text = (
-        "Тарифы:\n"
-        "• Легковой — 30 ₽/км\n"
-        "• Camry — 40 ₽/км\n"
-        "• Минивэн — 50 ₽/км\n\n"
-        "Цена = километры × цена за км."
+        " \n"
+        " \n"
+        "*Здравствуйте!*\n"
+        "Это бот междугороднего такси\n"
+        "*TransferAir Кавказские Минеральные Воды*.\n"
+        " \n"
+        "Нажмите *Старт*, чтобы продолжить."
     )
-    await message.answer(text, reply_markup=main_menu_kb())
+    await message.answer(text, parse_mode="Markdown", reply_markup=start_big_button_kb())
 
-@dp.message(F.text == "☎️ Поддержка")
-async def on_support(message: Message):
-    await message.answer("Напишите нам: @your_support (пример)", reply_markup=main_menu_kb())
+@dp.message(F.text == "▶️ Старт")
+async def on_big_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Выберите действие:", reply_markup=main_menu_kb())
 
+# ---- ДИСПЕТЧЕР ----
+@dp.message(F.text == "☎️ Диспетчер")
+async def on_dispatcher(message: Message):
+    await message.answer("Связаться с диспетчером: +7 934 024-14-14",
+                         reply_markup=main_menu_kb())
+    await message.answer("Нажмите кнопку ниже, чтобы позвонить:",
+                         reply_markup=None)
+    await bot.send_message(message.chat.id, "☎️", reply_markup=dispatcher_inline_kb())
+
+# ---- КАЛЬКУЛЯТОР ----
+@dp.message(F.text == "🧮 Калькулятор стоимости")
+async def calc_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(CalcStates.from_city)
+    await message.answer("Введите *город отправления*:", parse_mode="Markdown", reply_markup=main_menu_kb())
+
+@dp.message(CalcStates.from_city, F.text)
+async def calc_from_city(message: Message, state: FSMContext):
+    city = normalize_city(message.text)
+    if not city:
+        await message.answer("Пожалуйста, введите город отправления текстом.")
+        return
+    await state.update_data(from_city=city)
+    await state.set_state(CalcStates.to_city)
+    await message.answer("Введите *город прибытия*:", parse_mode="Markdown")
+
+@dp.message(CalcStates.to_city, F.text)
+async def calc_to_city(message: Message, state: FSMContext):
+    to_city = normalize_city(message.text)
+    data = await state.get_data()
+    from_city = data.get("from_city")
+
+    # геокодим обе точки и считаем км
+    async with aiohttp.ClientSession() as session:
+        a = await geocode_city(session, from_city)
+        b = await geocode_city(session, to_city)
+
+    if not a or not b:
+        await message.answer(
+            "Не удалось определить один из городов. Попробуйте указать полное название (например: "
+            "`Кисловодск`, `Ставрополь`, `Минеральные Воды`).",
+            parse_mode="Markdown"
+        )
+        return
+
+    dist = haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
+    # очень грубо, но для межгорода ок; минимум 1 км
+    dist = max(dist, 1.0)
+
+    txt = (
+        f"🧮 Калькулятор стоимости\n\n"
+        f"Из: *{from_city}*\n"
+        f"В: *{to_city}*\n\n"
+        f"{format_prices_km(dist)}"
+    )
+    await message.answer(txt, parse_mode="Markdown", reply_markup=main_menu_kb())
+    await state.clear()
+
+# ---- СДЕЛАТЬ ЗАКАЗ ----
 @dp.message(F.text == "📝 Сделать заказ")
-async def start_order(message: Message, state: FSMContext):
+async def order_start(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(OrderStates.waiting_from)
+    await state.set_state(OrderStates.from_city)
     await state.update_data(order={})
-    await message.answer(
-        "📍 Откуда подать машину?\n— Поделитесь геопозицией или введите адрес текстом.",
-        reply_markup=share_location_kb("Отправить геолокацию «Откуда»"),
-    )
+    await message.answer("Город *отправления*:", parse_mode="Markdown")
 
-@dp.message(OrderStates.waiting_from, F.location)
-async def got_from_geo(message: Message, state: FSMContext):
-    data = await state.get_data(); order = data.get("order", {})
-    order["from_geo"] = {"lat": message.location.latitude, "lon": message.location.longitude}
-    order["from_text"] = "Геолокация пользователя"
-    await state.update_data(order=order)
-    await state.set_state(OrderStates.waiting_to)
-    await message.answer(
-        "📍 Куда едем? Геопозиция или адрес.",
-        reply_markup=share_location_kb("Отправить геолокацию «Куда»"),
-    )
-
-@dp.message(OrderStates.waiting_from, F.text & (F.text.lower() == "пропустить и ввести адрес"))
-async def from_prompt_address(message: Message):
-    await message.answer("Введите адрес отправления текстом:", reply_markup=back_menu_kb())
-
-@dp.message(OrderStates.waiting_from, F.text)
-async def got_from_text(message: Message, state: FSMContext):
-    if message.text == "⬅️ Назад в меню":
-        await cmd_start(message, state); return
-    data = await state.get_data(); order = data.get("order", {})
-    order["from_text"] = message.text.strip()
-    await state.update_data(order=order)
-    await state.set_state(OrderStates.waiting_to)
-    await message.answer(
-        "📍 Куда едем? Геопозиция или адрес.",
-        reply_markup=share_location_kb("Отправить геолокацию «Куда»"),
-    )
-
-@dp.message(OrderStates.waiting_to, F.location)
-async def got_to_geo(message: Message, state: FSMContext):
-    data = await state.get_data(); order = data.get("order", {})
-    order["to_geo"] = {"lat": message.location.latitude, "lon": message.location.longitude}
-    order["to_text"] = "Геолокация пользователя"
-    await state.update_data(order=order)
-
-    if "from_geo" in order and "to_geo" in order:
-        dist = haversine_km(order["from_geo"]["lat"], order["from_geo"]["lon"],
-                            order["to_geo"]["lat"], order["to_geo"]["lon"])
-        order["distance_km"] = max(dist, 0.5)
-        await state.update_data(order=order)
-        await state.set_state(OrderStates.choose_tariff)
-        await message.answer("Выберите тариф:", reply_markup=tariffs_inline_kb())
-        return
-
-    await state.set_state(OrderStates.waiting_distance_km)
-    await message.answer(
-        "Если обе геоточки не отправляли — укажите *примерное расстояние* в км (числом).",
-        reply_markup=back_menu_kb(),
-    )
-
-@dp.message(OrderStates.waiting_to, F.text & (F.text.lower() == "пропустить и ввести адрес"))
-async def to_prompt_address(message: Message):
-    await message.answer("Введите адрес назначения текстом:", reply_markup=back_menu_kb())
-
-@dp.message(OrderStates.waiting_to, F.text)
-async def got_to_text(message: Message, state: FSMContext):
-    if message.text == "⬅️ Назад в меню":
-        await cmd_start(message, state); return
-    data = await state.get_data(); order = data.get("order", {})
-    order["to_text"] = message.text.strip()
-    await state.update_data(order=order)
-    await state.set_state(OrderStates.waiting_distance_km)
-    await message.answer(
-        "Укажите *примерное расстояние* в км (числом), например `7.5`.",
-        reply_markup=back_menu_kb(),
-    )
-
-@dp.message(OrderStates.waiting_distance_km, F.text)
-async def got_distance_text(message: Message, state: FSMContext):
-    if message.text == "⬅️ Назад в меню":
-        await cmd_start(message, state); return
-    try:
-        km = float(message.text.replace(",", "."))
-        if km <= 0: raise ValueError
-    except Exception:
-        await message.answer("Пожалуйста, отправьте расстояние *числом*, например: `6.2`")
+@dp.message(OrderStates.from_city, F.text)
+async def order_from_city(message: Message, state: FSMContext):
+    city = normalize_city(message.text)
+    if not city:
+        await message.answer("Введите город отправления текстом.")
         return
     data = await state.get_data(); order = data.get("order", {})
-    order["distance_km"] = km
+    order["from_city"] = city
     await state.update_data(order=order)
-    await state.set_state(OrderStates.choose_tariff)
-    await message.answer("Выберите тариф:", reply_markup=tariffs_inline_kb())
+    await state.set_state(OrderStates.to_city)
+    await message.answer("Город *прибытия*:", parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith("tariff:"))
-async def choose_tariff(cb: CallbackQuery, state: FSMContext):
-    key = cb.data.split(":", 1)[1]
-    if key not in TARIFFS:
-        await cb.answer("Неизвестный тариф", show_alert=True); return
+@dp.message(OrderStates.to_city, F.text)
+async def order_to_city(message: Message, state: FSMContext):
+    city = normalize_city(message.text)
+    if not city:
+        await message.answer("Введите город прибытия текстом.")
+        return
     data = await state.get_data(); order = data.get("order", {})
-    order["tariff"] = key
-
-    dist = order.get("distance_km", 0.0)
-    if dist <= 0:
-        await cb.answer("Не удалось определить расстояние", show_alert=True); return
-    calc = estimate_price(dist, key)
-    order["calc"] = calc
+    order["to_city"] = city
     await state.update_data(order=order)
+    await state.set_state(OrderStates.date)
+    await message.answer("Дата *подачи* (например, 31.10.2025):", parse_mode="Markdown")
 
-    text = (
-        f"🚕 *Предзаказ*\n"
-        f"Тариф: *{TARIFFS[key]['title']}*\n"
-        f"Откуда: {order.get('from_text', '—')}\n"
-        f"Куда: {order.get('to_text', '—')}\n"
-        f"Расстояние: ~{calc['distance_km']} км\n"
-        f"К оплате: *~{calc['price']} ₽*\n\n"
-        f"Подтвердить заказ?"
+@dp.message(OrderStates.date, F.text)
+async def order_date(message: Message, state: FSMContext):
+    date_text = normalize_city(message.text)
+    if not date_text:
+        await message.answer("Дата обязательна. Пример: 31.10.2025")
+        return
+    data = await state.get_data(); order = data.get("order", {})
+    order["date"] = date_text
+    await state.update_data(order=order)
+    await state.set_state(OrderStates.time)
+    await message.answer("Время *подачи* (например, 14:30):", parse_mode="Markdown")
+
+@dp.message(OrderStates.time, F.text)
+async def order_time(message: Message, state: FSMContext):
+    time_text = normalize_city(message.text)
+    if not time_text:
+        await message.answer("Время обязательно. Пример: 14:30")
+        return
+    data = await state.get_data(); order = data.get("order", {})
+    order["time"] = time_text
+    await state.update_data(order=order)
+    await state.set_state(OrderStates.phone)
+    await message.answer("Номер *телефона* (например, +7 999 123-45-67):", parse_mode="Markdown")
+
+@dp.message(OrderStates.phone, F.text)
+async def order_phone(message: Message, state: FSMContext):
+    phone = message.text.strip()
+    if not PHONE_RE.match(phone):
+        await message.answer("Укажите корректный номер телефона (например, +7 999 123-45-67)")
+        return
+    data = await state.get_data(); order = data.get("order", {})
+    order["phone"] = phone
+    await state.update_data(order=order)
+    await state.set_state(OrderStates.comment)
+    await message.answer("Комментарий к заказу (необязательно). Если нет — напишите «-».", parse_mode="Markdown")
+
+@dp.message(OrderStates.comment, F.text)
+async def order_comment(message: Message, state: FSMContext):
+    comment = message.text.strip()
+    if comment == "-":
+        comment = ""
+    data = await state.get_data(); order = data.get("order", {})
+    order["comment"] = comment
+
+    # Подтверждение
+    txt = (
+        "Проверьте данные заказа:\n\n"
+        f"Город отправления: *{order['from_city']}*\n"
+        f"Город прибытия: *{order['to_city']}*\n"
+        f"Дата: *{order['date']}*\n"
+        f"Время подачи: *{order['time']}*\n"
+        f"Телефон: *{order['phone']}*\n"
+        f"Комментарий: {order['comment'] or '—'}\n\n"
+        "Подтвердить?"
     )
-    await cb.message.edit_text(text, parse_mode="Markdown")
-    await cb.message.edit_reply_markup(reply_markup=confirm_inline_kb())
     await state.set_state(OrderStates.confirm)
-    await cb.answer()
+    await message.answer(txt, parse_mode="Markdown", reply_markup=confirm_order_kb())
 
-@dp.callback_query(F.data == "cancel")
-async def cancel_cb(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("Отменено.")
-    await cb.message.edit_reply_markup()
-    await cb.message.answer("Вы в меню:", reply_markup=main_menu_kb())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("confirm:"))
-async def confirm_order(cb: CallbackQuery, state: FSMContext):
-    decision = cb.data.split(":", 1)[1]
-    if decision == "no":
+@dp.callback_query(F.data.in_(["order_confirm", "order_edit", "order_cancel"]))
+async def order_finish(cb: CallbackQuery, state: FSMContext):
+    action = cb.data
+    if action == "order_cancel":
         await state.clear()
         await cb.message.edit_text("Заказ отменён.")
-        await cb.message.edit_reply_markup()
-        await cb.message.answer("Вы в меню:", reply_markup=main_menu_kb())
-        await cb.answer(); return
+        await cb.answer()
+        await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
+        return
 
-    data = await state.get_data(); order = data.get("order", {})
-    order_text = fmt_order_summary(order)
+    if action == "order_edit":
+        # простой вариант: начать заново
+        await state.clear()
+        await cb.message.edit_text("Изменим заказ. Заполните ещё раз, пожалуйста.")
+        await bot.send_message(cb.message.chat.id, "Город *отправления*:", parse_mode="Markdown")
+        await state.set_state(OrderStates.from_city)
+        await cb.answer()
+        return
 
-    await cb.message.edit_text("✅ Заказ подтверждён! Спасибо 🙌")
-    await cb.message.edit_reply_markup()
-    await cb.message.answer("Водитель скоро свяжется с вами. Вы в меню:", reply_markup=main_menu_kb())
+    # confirm
+    data = await state.get_data()
+    order = data.get("order", {})
     await state.clear()
 
+    await cb.message.edit_text("✅ Спасибо, Ваша заявка принята!\nВ ближайшее время с Вами свяжется диспетчер.")
+    await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
+    await cb.answer("Заявка отправлена")
+
+    # уведомление админу
     if ADMIN_CHAT_ID:
         try:
             user = cb.from_user
-            header = f"👤 Пользователь: {user.full_name} (id={user.id})"
+            header = f"👤 {user.full_name} (id={user.id})"
             if user.username:
-                header += f"\nUsername: @{user.username}"
-            await bot.send_message(ADMIN_CHAT_ID, header + "\n\n" + order_text, parse_mode="Markdown")
+                header += f" — @{user.username}"
+            txt = (
+                f"{header}\n\n"
+                "🆕 *Заявка на заказ*\n"
+                f"Откуда: *{order.get('from_city','')}*\n"
+                f"Куда: *{order.get('to_city','')}*\n"
+                f"Дата: *{order.get('date','')}*\n"
+                f"Время: *{order.get('time','')}*\n"
+                f"Телефон: *{order.get('phone','')}*\n"
+                f"Комментарий: {order.get('comment') or '—'}"
+            )
+            await bot.send_message(ADMIN_CHAT_ID, txt, parse_mode="Markdown")
         except Exception as e:
             logger.warning("Failed to notify admin: %s", e)
-
-    await cb.answer("Заказ отправлен!")
 
 # ================== FASTAPI + WEBHOOK ==================
 app = FastAPI()
@@ -333,7 +379,6 @@ async def _set_webhook_with_retry():
         try:
             await bot.set_my_commands([
                 BotCommand(command="start", description="Запуск"),
-                BotCommand(command="help", description="Помощь"),
             ])
             await bot.set_webhook(
                 url=url,
