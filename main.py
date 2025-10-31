@@ -3,6 +3,8 @@ import math
 import asyncio
 import logging
 import re
+import calendar as pycal
+from datetime import date, datetime, timedelta
 from typing import Final, Dict, Optional, Tuple, List
 
 from fastapi import FastAPI, Request, HTTPException
@@ -51,15 +53,13 @@ TARIFFS = {
 }
 
 # ================== ФИКСИРОВАННЫЕ ЦЕНЫ ==================
-# Ключи – нормализованные названия ПУНКТА НАЗНАЧЕНИЯ (из Минеральных Вод).
-# Значения – (легковой, camry, минивэн 5–6 чел)
 FIXED_PRICES: Dict[str, Tuple[int, int, int]] = {
     "железноводск": (800, 1500, 2000),
     "пятигорск": (1200, 1500, 1900),
     "ессентуки": (1300, 2000, 2500),
     "кисловодск": (1800, 2500, 3000),
 
-    # ОБНОВЛЁННЫЕ
+    # обновлённые блоки
     "архыз": (6500, 8000, 10000),
     "архыз романтик": (7000, 9000, 11000),
     "домбай": (6500, 8000, 10000),
@@ -169,7 +169,6 @@ FROM_ALIASES = {
     "мвр": "Минеральные Воды",
     "mrv": "Минеральные Воды",
 }
-
 DEST_ALIASES = {
     "железка": "железноводск",
     "жв": "железноводск",
@@ -245,12 +244,10 @@ DEST_OPTIONS: List[Tuple[str, str]] = [
 ]
 
 def from_suggestions_kb() -> InlineKeyboardMarkup:
-    # изменили второй ярлык на «Аэропорт MRV», callback к тем же Минеральным Водам
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Минеральные Воды", callback_data="from_pick:Минеральные Воды"),
         InlineKeyboardButton(text="Аэропорт MRV", callback_data="from_pick:Минеральные Воды"),
     ]])
-    return kb
 
 def dest_suggestions_kb(page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
     start = page * per_page
@@ -271,6 +268,68 @@ def dest_suggestions_kb(page: int = 0, per_page: int = 10) -> InlineKeyboardMark
     if nav:
         rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# ================== КАЛЕНДАРЬ (inline) ==================
+RU_MONTHS = [
+    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+]
+
+def date_calendar_kb(y: int, m: int) -> InlineKeyboardMarkup:
+    pycal.setfirstweekday(pycal.MONDAY)
+    month_cal = pycal.monthcalendar(y, m)  # список недель
+    header = [
+        [InlineKeyboardButton(text=f"{RU_MONTHS[m]} {y}", callback_data="noop")],
+        [
+            InlineKeyboardButton(text="Сегодня", callback_data="calpick:today"),
+            InlineKeyboardButton(text="Завтра", callback_data="calpick:tomorrow"),
+        ],
+        [
+            InlineKeyboardButton(text="Пн", callback_data="noop"),
+            InlineKeyboardButton(text="Вт", callback_data="noop"),
+            InlineKeyboardButton(text="Ср", callback_data="noop"),
+            InlineKeyboardButton(text="Чт", callback_data="noop"),
+            InlineKeyboardButton(text="Пт", callback_data="noop"),
+            InlineKeyboardButton(text="Сб", callback_data="noop"),
+            InlineKeyboardButton(text="Вс", callback_data="noop"),
+        ],
+    ]
+    rows = []
+    for week in month_cal:
+        row = []
+        for d in week:
+            if d == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+            else:
+                row.append(InlineKeyboardButton(text=str(d), callback_data=f"calpick:{y}:{m}:{d}"))
+        rows.append(row)
+    # навигация по месяцам
+    prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
+    next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+    nav = [[
+        InlineKeyboardButton(text="⏮️", callback_data=f"calnav:{prev_y}:{prev_m}"),
+        InlineKeyboardButton(text="Отмена", callback_data="calcancel"),
+        InlineKeyboardButton(text="⏭️", callback_data=f"calnav:{next_y}:{next_m}"),
+    ]]
+    return InlineKeyboardMarkup(inline_keyboard=header + rows + nav)
+
+def time_hours_kb() -> InlineKeyboardMarkup:
+    # 0..23 в сетке
+    rows, row = [], []
+    for h in range(24):
+        txt = f"{h:02d}"
+        row.append(InlineKeyboardButton(text=txt, callback_data=f"timeh:{h:02d}"))
+        if len(row) == 6:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="timecancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def time_minutes_kb(hour: str) -> InlineKeyboardMarkup:
+    mins = ["00", "15", "30", "45"]
+    row = [InlineKeyboardButton(text=f"{hour}:{m}", callback_data=f"timem:{hour}:{m}") for m in mins]
+    return InlineKeyboardMarkup(inline_keyboard=[row, [InlineKeyboardButton(text="Назад", callback_data="timeback"), InlineKeyboardButton(text="Отмена", callback_data="timecancel")]])
 
 # ================== КЛАВИАТУРЫ ОСНОВНОГО МЕНЮ ==================
 def start_big_button_kb() -> ReplyKeyboardMarkup:
@@ -326,7 +385,7 @@ class OrderForm(StatesGroup):
     comment = State()
     confirm = State()
 
-# ================== ХЕЛПЕРЫ ==================
+# ================== ХЕЛПЕРЫ (гео/цены) ==================
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -368,7 +427,7 @@ def per_km_prices(distance_km: float) -> Tuple[int, int, int]:
 
 PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{8,}$")
 
-# ================== ГЛОБАЛЬНЫЙ РОУТЕР МЕНЮ (работает в ЛЮБОМ состоянии) ==================
+# ================== ГЛОБАЛЬНЫЙ РОУТЕР МЕНЮ ==================
 @dp.message(F.text.in_(MENU_BUTTONS))
 async def menu_router(message: Message, state: FSMContext):
     await state.clear()
@@ -376,21 +435,14 @@ async def menu_router(message: Message, state: FSMContext):
 
     if text == BTN_CALC:
         await state.set_state(CalcStates.from_city)
-        await message.answer(
-            "Введите *город отправления* (или выберите ниже):",
-            parse_mode="Markdown",
-            reply_markup=None
-        )
+        await message.answer("Введите *город отправления* (или выберите ниже):", parse_mode="Markdown")
         await message.answer("Быстрый выбор:", reply_markup=from_suggestions_kb())
         return
 
     if text == BTN_ORDER:
         await state.set_state(OrderForm.from_city)
         await state.update_data(order={})
-        await message.answer(
-            "Введите *город отправления* (или выберите ниже):",
-            parse_mode="Markdown"
-        )
+        await message.answer("Введите *город отправления* (или выберите ниже):", parse_mode="Markdown")
         await message.answer("Быстрый выбор:", reply_markup=from_suggestions_kb())
         return
 
@@ -421,7 +473,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "Это бот междугороднего такси \n"
         "*TransferAir Кавказские Минеральные Воды*.\n"
         " \n"
-        f"Нажмите *{BTN_START.split()[0]} Старт*, чтобы продолжить."
+        "Нажмите *Старт*, чтобы продолжить."
     )
     await message.answer(text, parse_mode="Markdown", reply_markup=start_big_button_kb())
 
@@ -450,7 +502,7 @@ async def dispatcher_phone_cb(cb: CallbackQuery):
     )
     await cb.answer("Номер отправлен")
 
-# ================== ПОДХВАТ КЛИКОВ-ПОДСКАЗОК (from/to) ==================
+# ================== ПОДХВАТ FROM/TO ПОДСКАЗОК ==================
 @dp.callback_query(F.data.startswith("from_pick:"))
 async def pick_from(cb: CallbackQuery, state: FSMContext):
     from_city = cb.data.split(":", 1)[1]
@@ -535,9 +587,84 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
             order["to_city"] = display
             await state.update_data(order=order)
             await state.set_state(OrderForm.date)
-            await cb.message.edit_text(f"Направление: *{display}* ✅", parse_mode="Markdown")
-            await cb.message.answer("Введите *дату подачи* (например, 31.10.2025):", parse_mode="Markdown")
+
+            # показать календарь
+            today = date.today()
+            await cb.message.edit_text(
+                f"Направление: *{display}* ✅\n\nВыберите *дату подачи*:",
+                parse_mode="Markdown"
+            )
+            await cb.message.answer("Календарь:", reply_markup=date_calendar_kb(today.year, today.month))
     await cb.answer()
+
+# ---- КАЛЕНДАРЬ: обработчики ----
+@dp.callback_query(F.data == "calcancel")
+async def cal_cancel(cb: CallbackQuery, state: FSMContext):
+    await cb.message.delete()
+    await cb.answer("Выбор даты отменён")
+
+@dp.callback_query(F.data.startswith("calnav:"))
+async def cal_nav(cb: CallbackQuery):
+    _, y, m = cb.data.split(":")
+    y, m = int(y), int(m)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=date_calendar_kb(y, m))
+    except Exception:
+        await cb.message.answer("Календарь:", reply_markup=date_calendar_kb(y, m))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("calpick:"))
+async def cal_pick(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    if parts[1] in ("today", "tomorrow"):
+        d = date.today() if parts[1] == "today" else date.today() + timedelta(days=1)
+    else:
+        y, m, d_ = map(int, parts[1:4])
+        d = date(y, m, d_)
+
+    # сохранить дату в заказе и открыть выбор ВРЕМЕНИ
+    data = await state.get_data()
+    order = data.get("order", {})
+    order["date"] = d.strftime("%d.%m.%Y")
+    await state.update_data(order=order)
+
+    await cb.message.edit_text(f"Дата подачи: *{order['date']}* ✅\nВыберите *время подачи*:", parse_mode="Markdown")
+    await cb.message.answer("Часы:", reply_markup=time_hours_kb())
+    await cb.answer("Дата выбрана")
+
+# ---- TIME PICKER ----
+@dp.callback_query(F.data == "timecancel")
+async def time_cancel(cb: CallbackQuery):
+    await cb.message.delete()
+    await cb.answer("Выбор времени отменён")
+
+@dp.callback_query(F.data == "timeback")
+async def time_back(cb: CallbackQuery):
+    await cb.message.edit_text("Выберите *время подачи*:", parse_mode="Markdown")
+    await cb.message.edit_reply_markup(reply_markup=time_hours_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("timeh:"))
+async def time_pick_hour(cb: CallbackQuery):
+    hour = cb.data.split(":")[1]
+    await cb.message.edit_text(f"Выберите минуты для *{hour}:__*", parse_mode="MarkdownV2")
+    await cb.message.edit_reply_markup(reply_markup=time_minutes_kb(hour))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("timem:"))
+async def time_pick_min(cb: CallbackQuery, state: FSMContext):
+    _, hour, minute = cb.data.split(":")
+    tm = f"{hour}:{minute}"
+
+    data = await state.get_data()
+    order = data.get("order", {})
+    order["time"] = tm
+    await state.update_data(order=order)
+
+    await cb.message.edit_text(f"Время подачи: *{tm}* ✅", parse_mode="Markdown")
+    await cb.message.answer("Введите *номер телефона* (+7 ...):", parse_mode="Markdown")
+    await state.set_state(OrderForm.phone)
+    await cb.answer("Время выбрано")
 
 # ---- КАЛЬКУЛЯТОР (ручной ввод) ----
 @dp.message(CalcStates.from_city, F.text)
@@ -588,7 +715,7 @@ async def calc_to_city(message: Message, state: FSMContext):
     await message.answer(txt, parse_mode="Markdown", reply_markup=main_menu_kb())
     await state.clear()
 
-# ---- СДЕЛАТЬ ЗАКАЗ ----
+# ---- СДЕЛАТЬ ЗАКАЗ (ручной ввод как fallback) ----
 @dp.message(OrderForm.from_city, F.text)
 async def order_from_city(message: Message, state: FSMContext):
     order = {"from_city": resolve_from_city(message.text)}
@@ -603,19 +730,23 @@ async def order_to_city(message: Message, state: FSMContext):
     order["to_city"] = normalize_city(message.text)
     await state.update_data(order=order)
     await state.set_state(OrderForm.date)
-    await message.answer("Введите *дату подачи* (например, 31.10.2025):", parse_mode="Markdown")
+
+    # Показать календарь сразу
+    today = date.today()
+    await message.answer("Выберите *дату подачи*:", parse_mode="Markdown", reply_markup=date_calendar_kb(today.year, today.month))
 
 @dp.message(OrderForm.date, F.text)
-async def order_date(message: Message, state: FSMContext):
-    data = await state.get_data(); order = data.get("order", {})
+async def order_date_text_fallback(message: Message, state: FSMContext):
+    # Если пользователь всё же ввёл текстом
+    order = (await state.get_data()).get("order", {})
     order["date"] = normalize_city(message.text)
     await state.update_data(order=order)
     await state.set_state(OrderForm.time)
-    await message.answer("Введите *время подачи* (например, 14:30):", parse_mode="Markdown")
+    await message.answer("Выберите *время подачи*:", parse_mode="Markdown", reply_markup=time_hours_kb())
 
 @dp.message(OrderForm.time, F.text)
-async def order_time(message: Message, state: FSMContext):
-    data = await state.get_data(); order = data.get("order", {})
+async def order_time_text_fallback(message: Message, state: FSMContext):
+    order = (await state.get_data()).get("order", {})
     order["time"] = normalize_city(message.text)
     await state.update_data(order=order)
     await state.set_state(OrderForm.phone)
@@ -641,12 +772,12 @@ async def order_comment(message: Message, state: FSMContext):
     await state.update_data(order=order)
     txt = (
         f"Проверьте данные заказа:\n\n"
-        f"Откуда: *{order['from_city']}*\n"
-        f"Куда: *{order['to_city']}*\n"
-        f"Дата: *{order['date']}*\n"
-        f"Время: *{order['time']}*\n"
-        f"Телефон: *{order['phone']}*\n"
-        f"Комментарий: {order['comment'] or '—'}\n\n"
+        f"Откуда: *{order.get('from_city','')}*\n"
+        f"Куда: *{order.get('to_city','')}*\n"
+        f"Дата: *{order.get('date','')}*\n"
+        f"Время: *{order.get('time','')}*\n"
+        f"Телефон: *{order.get('phone','')}*\n"
+        f"Комментарий: {order.get('comment') or '—'}\n\n"
         "Подтвердить?"
     )
     await state.set_state(OrderForm.confirm)
@@ -680,10 +811,10 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
             user = cb.from_user
             txt = (
                 f"🆕 *Заявка на заказ*\n\n"
-                f"От: *{order['from_city']}* → *{order['to_city']}*\n"
-                f"Дата: *{order['date']}*, Время: *{order['time']}*\n"
-                f"Телефон: *{order['phone']}*\n"
-                f"Комментарий: {order['comment'] or '—'}\n\n"
+                f"От: *{order.get('from_city','')}* → *{order.get('to_city','')}*\n"
+                f"Дата: *{order.get('date','')}*, Время: *{order.get('time','')}*\n"
+                f"Телефон: *{order.get('phone','')}*\n"
+                f"Комментарий: {order.get('comment') or '—'}\n\n"
                 f"👤 {user.full_name} (id={user.id})"
             )
             await bot.send_message(ADMIN_CHAT_ID, txt, parse_mode="Markdown")
