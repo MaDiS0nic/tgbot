@@ -45,30 +45,31 @@ MENU_BUTTONS = [BTN_CALC, BTN_ORDER, BTN_DISPATCHER, BTN_INFO]
 
 # ================== ТАРИФЫ (пер.км для городов без фикса) ==================
 TARIFFS = {
-    "econom":  {"title": "Легковой", "per_km": 30},
-    "camry":   {"title": "Camry",    "per_km": 40},
-    "minivan": {"title": "Минивэн",  "per_km": 50},
+    "econom":  {"title": "Легковой",            "per_km": 30},
+    "camry":   {"title": "Camry",               "per_km": 40},
+    "minivan": {"title": "Минивэн (5–6 чел)",   "per_km": 50},
 }
 
 # ================== ФИКСИРОВАННЫЕ ЦЕНЫ ==================
 # Ключи – нормализованные названия ПУНКТА НАЗНАЧЕНИЯ (из Минеральных Вод).
-# Значения – (легковой, camry, минивэн)
+# Значения – (легковой, camry, минивэн 5–6 чел)
 FIXED_PRICES: Dict[str, Tuple[int, int, int]] = {
     "железноводск": (800, 1500, 2000),
     "пятигорск": (1200, 1500, 1900),
     "ессентуки": (1300, 2000, 2500),
     "кисловодск": (1800, 2500, 3000),
 
+    # ОБНОВЛЁННЫЕ
     "архыз": (6500, 8000, 10000),
     "архыз романтик": (7000, 9000, 11000),
     "домбай": (6500, 8000, 10000),
     "азау": (5500, 7500, 9000),
     "терскол": (5500, 7500, 9000),
-    "эльбрус": (5500, 7500, 8500),
-    "теберда": (5500, 7500, 8500),
-    "нейтрино": (5000, 7500, 8500),
-    "тегенекли": (5000, 7500, 8500),
-    "байдаево": (5000, 7500, 8500),
+    "эльбрус": (5500, 7500, 9000),
+    "теберда": (5500, 7500, 9000),
+    "нейтрино": (5000, 7500, 9000),
+    "тегенекли": (5000, 7500, 9000),
+    "байдаево": (5000, 7500, 9000),
     "чегет": (5500, 7500, 9000),
 
     "ставрополь": (5400, 7200, 9000),
@@ -157,7 +158,6 @@ FIXED_PRICES: Dict[str, Tuple[int, int, int]] = {
 }
 
 # ================== АЛИАСЫ/СИНОНИМЫ ==================
-# from-синонимы (все приводим к «Минеральные Воды»)
 FROM_ALIASES = {
     "минводы": "Минеральные Воды",
     "минеральные воды": "Минеральные Воды",
@@ -170,24 +170,18 @@ FROM_ALIASES = {
     "mrv": "Минеральные Воды",
 }
 
-# dest-алиасы: ключ – вариант ввода (нормализованный), значение – КЛЮЧ из FIXED_PRICES
 DEST_ALIASES = {
-    # курортные
     "железка": "железноводск",
     "жв": "железноводск",
     "пятиг": "пятигорск",
     "ессы": "ессентуки",
     "кислов": "кисловодск",
-
-    # эльбрус/домбай
     "романтик": "архыз романтик",
     "архыз-романтик": "архыз романтик",
     "приэльбрусье": "эльбрус",
     "поляна азау": "азау",
     "мир азау": "азау",
     "чегет поляна": "чегет",
-
-    # города
     "ставрик": "ставрополь",
     "владикавк": "владикавказ",
     "гроз": "грозный",
@@ -216,8 +210,7 @@ def resolve_dest_key(text: str) -> str:
         return key
     return DEST_ALIASES.get(key, key)
 
-# ================== ПРЕДУСТАНОВЛЕННЫЕ ПОДСКАЗКИ ДЛЯ ВЫБОРА ГОРОДА ==================
-# список «красивое название», «ключ FIXED_PRICES»
+# ================== ПОДСКАЗКИ ГОРОДОВ ==================
 DEST_OPTIONS: List[Tuple[str, str]] = [
     ("Железноводск", "железноводск"),
     ("Пятигорск", "пятигорск"),
@@ -252,9 +245,10 @@ DEST_OPTIONS: List[Tuple[str, str]] = [
 ]
 
 def from_suggestions_kb() -> InlineKeyboardMarkup:
+    # изменили второй ярлык на «Аэропорт MRV», callback к тем же Минеральным Водам
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Минеральные Воды", callback_data="from_pick:Минеральные Воды"),
-        InlineKeyboardButton(text="Минеральные Воды (аэропорт)", callback_data="from_pick:Минеральные Воды"),
+        InlineKeyboardButton(text="Аэропорт MRV", callback_data="from_pick:Минеральные Воды"),
     ]])
     return kb
 
@@ -268,7 +262,6 @@ def dest_suggestions_kb(page: int = 0, per_page: int = 10) -> InlineKeyboardMark
         for disp, key in pair:
             row.append(InlineKeyboardButton(text=disp, callback_data=f"dest_pick:{key}"))
         rows.append(row)
-    # пагинация
     max_page = (len(DEST_OPTIONS) - 1) // per_page
     nav = []
     if page > 0:
@@ -361,9 +354,9 @@ async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Di
 def prices_text_total_only(econom: int, camry: int, minivan: int) -> str:
     return (
         f"💰 Стоимость:\n"
-        f"• Легковой — ~{econom} ₽\n"
-        f"• Camry — ~{camry} ₽\n"
-        f"• Минивэн — ~{minivan} ₽"
+        f"• {TARIFFS['econom']['title']} — ~{econom} ₽\n"
+        f"• {TARIFFS['camry']['title']} — ~{camry} ₽\n"
+        f"• {TARIFFS['minivan']['title']} — ~{minivan} ₽"
     )
 
 def per_km_prices(distance_km: float) -> Tuple[int, int, int]:
@@ -461,20 +454,24 @@ async def dispatcher_phone_cb(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("from_pick:"))
 async def pick_from(cb: CallbackQuery, state: FSMContext):
     from_city = cb.data.split(":", 1)[1]
-    # Куда дальше направлять – зависит от сценария
     current = await state.get_state()
     if current and current.endswith("from_city"):
         if current.startswith("CalcStates"):
             await state.update_data(from_city=from_city)
             await state.set_state(CalcStates.to_city)
-            await cb.message.edit_text(f"Отправление: *{from_city}* ✅\nВведите *город прибытия* (или выберите ниже):", parse_mode="Markdown")
+            await cb.message.edit_text(
+                f"Отправление: *{from_city}* ✅\nВведите *город прибытия* (или выберите ниже):",
+                parse_mode="Markdown"
+            )
             await cb.message.answer("Быстрый выбор:", reply_markup=dest_suggestions_kb(0))
         else:
-            # OrderForm
             order = {"from_city": from_city}
             await state.update_data(order=order)
             await state.set_state(OrderForm.to_city)
-            await cb.message.edit_text(f"Отправление: *{from_city}* ✅\nВведите *город прибытия* (или выберите ниже):", parse_mode="Markdown")
+            await cb.message.edit_text(
+                f"Отправление: *{from_city}* ✅\nВведите *город прибытия* (или выберите ниже):",
+                parse_mode="Markdown"
+            )
             await cb.message.answer("Быстрый выбор:", reply_markup=dest_suggestions_kb(0))
     await cb.answer()
 
@@ -484,19 +481,17 @@ async def dest_page(cb: CallbackQuery):
     try:
         await cb.message.edit_reply_markup(reply_markup=dest_suggestions_kb(page))
     except Exception:
-        # если сообщение без разметки – отправим новое
         await cb.message.answer("Ещё варианты:", reply_markup=dest_suggestions_kb(page))
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("dest_pick:"))
 async def dest_pick(cb: CallbackQuery, state: FSMContext):
-    key = cb.data.split(":", 1)[1]  # ключ FIXED_PRICES
+    key = cb.data.split(":", 1)[1]
     display = next((d for d, k in DEST_OPTIONS if k == key), key.title())
 
     current = await state.get_state()
     if current and current.endswith("to_city"):
         if current.startswith("CalcStates"):
-            # завершаем калькулятор – либо фикс, либо расстояние
             data = await state.get_data()
             from_city = data.get("from_city") or "Минеральные Воды"
             await state.clear()
@@ -513,7 +508,7 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
                 await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
                 await cb.answer()
                 return
-            # fallback: считаем по расстоянию
+
             async with aiohttp.ClientSession() as session:
                 a = await geocode_city(session, from_city)
                 b = await geocode_city(session, display)
@@ -535,7 +530,6 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
             return
 
         else:
-            # OrderForm: подставляем «to_city» и продолжаем форму
             data = await state.get_data()
             order = data.get("order", {})
             order["to_city"] = display
@@ -560,10 +554,8 @@ async def calc_to_city(message: Message, state: FSMContext):
     data = await state.get_data()
     from_city = data.get("from_city") or "Минеральные Воды"
 
-    # алиас → ключ
     to_key = resolve_dest_key(to_raw)
 
-    # 1) если фикс и отправление МинВоды
     if to_key in FIXED_PRICES and _norm_key(from_city) in {"минеральные воды"}:
         e, c, m = FIXED_PRICES[to_key]
         txt = (
@@ -576,7 +568,6 @@ async def calc_to_city(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    # 2) иначе считаем по расстоянию (но показываем только суммы)
     async with aiohttp.ClientSession() as session:
         a = await geocode_city(session, from_city)
         b = await geocode_city(session, to_raw)
