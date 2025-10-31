@@ -3,9 +3,12 @@ import math
 import asyncio
 import logging
 import re
+from functools import lru_cache
+from datetime import datetime
 from typing import Final, Dict, Optional
 
 from fastapi import FastAPI, Request, HTTPException
+from starlette.responses import JSONResponse
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -16,18 +19,35 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 import aiohttp
 
+# --------- .env (необязательно, но удобно) ---------
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
 # ================== CONFIG ==================
 BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "")
 APP_BASE_URL: Final[str] = os.getenv("APP_BASE_URL", "").rstrip("/")
 WEBHOOK_SECRET: Final[str] = os.getenv("WEBHOOK_SECRET", "")
-
+USE_WEBHOOK: bool = os.getenv("USE_WEBHOOK", "true").lower() in ("1", "true", "yes")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7039409310") or 7039409310)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
+if USE_WEBHOOK:
+    # Для режима вебхука нужен base URL + secret
+    if not APP_BASE_URL:
+        raise RuntimeError("APP_BASE_URL is not set (required in webhook mode)")
+    if not WEBHOOK_SECRET:
+        raise RuntimeError("WEBHOOK_SECRET is not set (required in webhook mode)")
+
+WEBHOOK_PATH = "/webhook"  # фиксированный путь
+WEBHOOK_URL = f"{APP_BASE_URL}{WEBHOOK_PATH}" if USE_WEBHOOK else ""
+
 # ================== LOGGING ==================
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("tgbot")
 
 # ================== AIOGRAM CORE ==================
@@ -85,7 +105,7 @@ class CalcStates(StatesGroup):
     from_city = State()
     to_city = State()
 
-class OrderStates(StatesGroup):
+class OrderForm(StatesGroup):
     from_city = State()
     to_city = State()
     date = State()
@@ -103,10 +123,25 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dphi/2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb/2) ** 2
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
+@lru_cache(maxsize=512)
+def _cached_city_key(city: str) -> str:
+    # Нормализованный ключ для кэша
+    return " ".join(city.strip().split()).lower()
+
+@lru_cache(maxsize=512)
+def _geocode_cached(city_norm_key: str) -> Optional[Dict[str, float]]:
+    # Пустышка для сигнатуры кэша — реальный http идёт в async-обёртке
+    return None
+
 async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Dict[str, float]]:
+    key = _cached_city_key(city)
+    cached = _geocode_cached(key)
+    if cached:
+        return cached
+
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": city, "format": "json", "limit": 1}
-    headers = {"User-Agent": "TransferAir-KMV-Bot/1.0 (admin@example.com)"}
+    headers = {"User-Agent": "TransferAir-KMV-Bot/1.1 (admin@example.com)"}
     try:
         async with session.get(url, params=params, headers=headers, timeout=20) as r:
             if r.status != 200:
@@ -114,7 +149,16 @@ async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Di
             data = await r.json()
             if not data:
                 return None
-            return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"])}
+            result = {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"])}
+            # Прокладываем в LRU-кэш через хак: сохраняем из async-функции
+            _geocode_cached.cache_clear()  # на случай коллизий ключей
+            @lru_cache(maxsize=512)
+            def _store(k: str, v: tuple) -> tuple:
+                return v
+            _store(key, (result["lat"], result["lon"]))
+            # Обратно читаем, чтобы следующий вызов был мгновенным
+            return {"lat": _store(key, (result["lat"], result["lon"]))[0],
+                    "lon": _store(key, (result["lat"], result["lon"]))[1]}
     except Exception as e:
         logger.warning(f"Geocode failed for {city}: {e}")
         return None
@@ -136,6 +180,22 @@ def prices_block(distance_km: float) -> str:
     )
 
 PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{8,}$")
+DATE_FMT = "%d.%m.%Y"
+TIME_FMT = "%H:%M"
+
+def _parse_date(text: str) -> Optional[str]:
+    try:
+        dt = datetime.strptime(text.strip(), DATE_FMT)
+        return dt.strftime(DATE_FMT)
+    except Exception:
+        return None
+
+def _parse_time(text: str) -> Optional[str]:
+    try:
+        tm = datetime.strptime(text.strip(), TIME_FMT)
+        return tm.strftime(TIME_FMT)
+    except Exception:
+        return None
 
 # ================== ХЕНДЛЕРЫ ==================
 @dp.message(CommandStart())
@@ -143,8 +203,8 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     text = (
         " \n"
-        "*Здравствуйте!* \n"
-        "Это бот междугороднего такси \n"
+        "*Здравствуйте!*\n"
+        "Это бот междугороднего такси\n"
         "*TransferAir Кавказские Минеральные Воды*.\n"
         " \n"
         "Нажмите *Старт*, чтобы продолжить."
@@ -217,15 +277,6 @@ async def calc_to_city(message: Message, state: FSMContext):
     await state.clear()
 
 # ---- СДЕЛАТЬ ЗАКАЗ ----
-class OrderForm(StatesGroup):
-    from_city = State()
-    to_city = State()
-    date = State()
-    time = State()
-    phone = State()
-    comment = State()
-    confirm = State()
-
 @dp.message(F.text == "📝 Сделать заказ")
 async def order_start(message: Message, state: FSMContext):
     await state.clear()
@@ -251,7 +302,11 @@ async def order_to_city(message: Message, state: FSMContext):
 @dp.message(OrderForm.date, F.text)
 async def order_date(message: Message, state: FSMContext):
     data = await state.get_data(); order = data.get("order", {})
-    order["date"] = normalize_city(message.text)
+    maybe_date = _parse_date(message.text)
+    if not maybe_date:
+        await message.answer("❗ Укажите дату в формате ДД.ММ.ГГГГ (например, 31.10.2025)")
+        return
+    order["date"] = maybe_date
     await state.update_data(order=order)
     await state.set_state(OrderForm.time)
     await message.answer("Введите *время подачи* (например, 14:30):", parse_mode="Markdown")
@@ -259,7 +314,11 @@ async def order_date(message: Message, state: FSMContext):
 @dp.message(OrderForm.time, F.text)
 async def order_time(message: Message, state: FSMContext):
     data = await state.get_data(); order = data.get("order", {})
-    order["time"] = normalize_city(message.text)
+    maybe_time = _parse_time(message.text)
+    if not maybe_time:
+        await message.answer("❗ Укажите время в формате ЧЧ:ММ (например, 14:30)")
+        return
+    order["time"] = maybe_time
     await state.update_data(order=order)
     await state.set_state(OrderForm.phone)
     await message.answer("Введите *номер телефона* (+7 ...):", parse_mode="Markdown")
@@ -333,46 +392,72 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
         except Exception as e:
             logger.warning(f"Failed to notify admin: {e}")
 
-# ================== FASTAPI + WEBHOOK ==================
+# ================== FASTAPI + WEBHOOK/POLLING ==================
 app = FastAPI()
 
 @app.get("/")
 async def healthcheck():
-    return {"status": "ok"}
+    return {"status": "ok", "mode": "webhook" if USE_WEBHOOK else "polling"}
 
-@app.post(f"/webhook/{{secret}}")
-async def telegram_webhook(secret: str, request: Request):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+def _validate_telegram_secret(request: Request):
+    # Telegram присылает секрет в заголовке X-Telegram-Bot-Api-Secret-Token
+    header = request.headers.get("x-telegram-bot-api-secret-token")
+    if not header or header != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    if USE_WEBHOOK:
+        _validate_telegram_secret(request)
     data = await request.json()
     update = Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
 async def _set_webhook_with_retry():
-    if not APP_BASE_URL:
-        logger.warning("APP_BASE_URL не задан — вебхук не будет установлен")
+    if not USE_WEBHOOK:
         return
-    url = f"{APP_BASE_URL}/webhook/{WEBHOOK_SECRET or ''}".rstrip("/")
+    url = WEBHOOK_URL
     while True:
         try:
             await bot.set_my_commands([BotCommand(command="start", description="Запуск")])
-            await bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET or None, drop_pending_updates=True)
+            await bot.set_webhook(
+                url=url,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=True
+            )
             logger.info("Webhook set to %s", url)
             break
         except Exception as e:
             logger.warning("Webhook not set yet (%s). Retrying soon…", e)
             await asyncio.sleep(30)
 
+async def _start_polling():
+    # локальный режим (без вебхука)
+    await bot.set_my_commands([BotCommand(command="start", description="Запуск")])
+    logger.info("Starting polling…")
+    await dp.start_polling(bot)
+
 @app.on_event("startup")
 async def on_startup():
-    asyncio.create_task(_set_webhook_with_retry())
-    logger.info("Startup complete. Waiting for webhook setup…")
+    if USE_WEBHOOK:
+        asyncio.create_task(_set_webhook_with_retry())
+        logger.info("Startup complete. Waiting for webhook setup…")
+    else:
+        # В polling нельзя блокировать ивент-луп — стартуем в фоне.
+        asyncio.create_task(_start_polling())
 
 @app.on_event("shutdown")
 async def on_shutdown():
     try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        logger.info("Webhook removed")
+        if USE_WEBHOOK:
+            await bot.delete_webhook(drop_pending_updates=False)
+            logger.info("Webhook removed")
     except Exception as e:
         logger.warning(f"Failed to delete webhook: {e}")
+
+# --------- Глобальный ловец ошибок FastAPI (красивее 500) ---------
+@app.exception_handler(Exception)
+async def on_error(request: Request, exc: Exception):
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
