@@ -84,7 +84,7 @@ def dispatcher_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="💬 Написать диспетчеру в Telegram",
-            url="https://t.me/sergeomoscarpone"
+            url="https://t.me/zhelektown"
         )
     ], [
         InlineKeyboardButton(
