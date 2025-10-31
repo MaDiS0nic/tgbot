@@ -312,6 +312,25 @@ def date_calendar_kb(y: int, m: int) -> InlineKeyboardMarkup:
     ]]
     return InlineKeyboardMarkup(inline_keyboard=header + rows + nav)
 
+# ================== ПАССАЖИРЫ (inline выбор количества) ==================
+def pax_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="1", callback_data="pax:1"),
+            InlineKeyboardButton(text="2", callback_data="pax:2"),
+            InlineKeyboardButton(text="3", callback_data="pax:3"),
+        ],
+        [
+            InlineKeyboardButton(text="4", callback_data="pax:4"),
+            InlineKeyboardButton(text="5", callback_data="pax:5"),
+            InlineKeyboardButton(text="6", callback_data="pax:6"),
+        ],
+        [
+            InlineKeyboardButton(text="7 и более", callback_data="pax:7+"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 # ================== КЛАВИАТУРЫ ОСНОВНОГО МЕНЮ ==================
 def start_big_button_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -336,7 +355,7 @@ def dispatcher_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="💬 Написать диспетчеру в Telegram",
-            url="https://t.me/zhelektown"   # <-- обновлено
+            url="https://t.me/zhelektown"
         )
     ], [
         InlineKeyboardButton(
@@ -362,6 +381,7 @@ class OrderForm(StatesGroup):
     to_city = State()
     date = State()
     time = State()
+    pax = State()      # <-- НОВОЕ: количество пассажиров
     phone = State()
     comment = State()
     confirm = State()
@@ -396,7 +416,7 @@ def prices_text_total_only(econom: int, camry: int, minivan: int) -> str:
         f"💰 Стоимость:\n"
         f"• {TARIFFS['econom']['title']} — ~{econom} ₽\n"
         f"• {TARIFFS['camry']['title']} — ~{camry} ₽\n"
-        f"• {TARIFFS['minivan']['title']} — ~{minivan} ₽"
+        f"• {TARIФFS['minivan']['title']} — ~{minivan} ₽"
     )
 
 def per_km_prices(distance_km: float) -> Tuple[int, int, int]:
@@ -669,7 +689,7 @@ async def calc_to_city(message: Message, state: FSMContext):
     await message.answer(txt, parse_mode="Markdown", reply_markup=main_menu_kb())
     await state.clear()
 
-# ---- СДЕЛАТЬ ЗАКАЗ (ручной ввод + календарь для даты) ----
+# ---- СДЕЛАТЬ ЗАКАЗ (ручной ввод + календарь для даты + выбор пассажиров) ----
 @dp.message(OrderForm.from_city, F.text)
 async def order_from_city(message: Message, state: FSMContext):
     order = {"from_city": resolve_from_city(message.text)}
@@ -691,7 +711,6 @@ async def order_to_city(message: Message, state: FSMContext):
 
 @dp.message(OrderForm.date, F.text)
 async def order_date_text_fallback(message: Message, state: FSMContext):
-    # Если пользователь всё же ввёл дату текстом
     order = (await state.get_data()).get("order", {})
     order["date"] = normalize_city(message.text)
     await state.update_data(order=order)
@@ -702,6 +721,40 @@ async def order_date_text_fallback(message: Message, state: FSMContext):
 async def order_time(message: Message, state: FSMContext):
     order = (await state.get_data()).get("order", {})
     order["time"] = normalize_city(message.text)
+    await state.update_data(order=order)
+
+    # Новый шаг: выбор количества пассажиров
+    await state.set_state(OrderForm.pax)
+    await message.answer("Укажите *количество человек*:", parse_mode="Markdown", reply_markup=pax_kb())
+
+@dp.callback_query(F.data.startswith("pax:"))
+async def pax_pick(cb: CallbackQuery, state: FSMContext):
+    value = cb.data.split(":", 1)[1]  # "1".."6" или "7+"
+    data = await state.get_data()
+    order = data.get("order", {})
+    order["pax"] = "7 и более" if value == "7+" else value
+    await state.update_data(order=order)
+
+    await cb.message.edit_text(f"Пассажиров: *{order['pax']}* ✅", parse_mode="Markdown")
+    await bot.send_message(cb.message.chat.id, "Введите *номер телефона* (+7 ...):", parse_mode="Markdown")
+    await state.set_state(OrderForm.phone)
+    await cb.answer("Количество пассажиров указано")
+
+@dp.message(OrderForm.pax, F.text)
+async def pax_text_fallback(message: Message, state: FSMContext):
+    """Если пользователь всё же ввёл число текстом."""
+    raw = message.text.strip().lower()
+    mapped = None
+    if raw in {"1","2","3","4","5","6"}:
+        mapped = raw
+    elif raw in {"7","7+","7 и более","7 или больше","семь","семь и более"}:
+        mapped = "7 и более"
+    if mapped is None:
+        await message.answer("Пожалуйста, укажите количество кнопкой или числом 1–6, либо «7 и более».", reply_markup=pax_kb())
+        return
+
+    order = (await state.get_data()).get("order", {})
+    order["pax"] = mapped
     await state.update_data(order=order)
     await state.set_state(OrderForm.phone)
     await message.answer("Введите *номер телефона* (+7 ...):", parse_mode="Markdown")
@@ -730,6 +783,7 @@ async def order_comment(message: Message, state: FSMContext):
         f"Куда: *{order.get('to_city','')}*\n"
         f"Дата: *{order.get('date','')}*\n"
         f"Время: *{order.get('time','')}*\n"
+        f"Пассажиров: *{order.get('pax','')}*\n"
         f"Телефон: *{order.get('phone','')}*\n"
         f"Комментарий: {order.get('comment') or '—'}\n\n"
         "Подтвердить?"
@@ -767,6 +821,7 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
                 f"🆕 *Заявка на заказ*\n\n"
                 f"От: *{order.get('from_city','')}* → *{order.get('to_city','')}*\n"
                 f"Дата: *{order.get('date','')}*, Время: *{order.get('time','')}*\n"
+                f"Пассажиров: *{order.get('pax','')}*\n"
                 f"Телефон: *{order.get('phone','')}*\n"
                 f"Комментарий: {order.get('comment') or '—'}\n\n"
                 f"👤 {user.full_name} (id={user.id})"
