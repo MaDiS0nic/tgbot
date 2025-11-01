@@ -205,11 +205,9 @@ def resolve_from_city(text: str) -> str:
     return FROM_ALIASES.get(key, normalize_city(text))
 
 def guess_from_display(text: str) -> str:
-    """Определяет отображаемое название отправления по вводу пользователя."""
     key = _norm_key(text)
     if "аэропорт" in key or "mrv" in key:
         return "Аэропорт MRV"
-    # если пользователь явно написал ровно "аэропорт mrv"
     if key in {"аэропорт mrv", "аэропорт мв"}:
         return "Аэропорт MRV"
     return "Минеральные Воды"
@@ -256,7 +254,6 @@ DEST_OPTIONS: List[Tuple[str, str]] = [
 
 # ---- компактные callback'и для from_pick ----
 FROM_CHOICES = {
-    # key: (canonical_from, display_from)
     "mv":  ("Минеральные Воды", "Минеральные Воды"),
     "mrv": ("Минеральные Воды", "Аэропорт MRV"),
 }
@@ -562,12 +559,9 @@ async def on_dispatcher(message: Message):
 
 @dp.callback_query(F.data == "dispatcher_phone")
 async def dispatcher_phone_cb(cb: CallbackQuery):
-    await bot.send_contact(
-        chat_id=cb.message.chat.id,
-        phone_number=DISPATCHER_PHONE,
-        first_name=DISPATCHER_NAME,
-    )
-    await cb.answer("Контакт отправлен")
+    # Просто текст с номером, чтобы Telegram сделал его кликабельным (как в «Информация»)
+    await cb.message.answer(f"📞 Телефон диспетчера: {DISPATCHER_PHONE}\nНажмите на номер, чтобы позвонить.")
+    await cb.answer("Номер отправлен")
 
 # ================== ПОДХВАТ FROM/TO ПОДСКАЗОК ==================
 @dp.callback_query(F.data.startswith("fp:"))
@@ -812,7 +806,7 @@ async def calc_to_city(message: Message, state: FSMContext):
         await message.answer("Произошла ошибка при расчёте. Попробуйте ещё раз.", reply_markup=main_menu_kb())
         await state.clear()
 
-# ---- СДЕЛАТЬ ЗАКАЗ (ручной ввод + календарь + время + пассажиры + комментарий по выбору) ----
+# ---- СДЕЛАТЬ ЗАКАЗ ----
 @dp.message(OrderForm.from_city, F.text)
 async def order_from_city(message: Message, state: FSMContext):
     from_city_input = normalize_city(message.text)
@@ -831,7 +825,6 @@ async def order_to_city(message: Message, state: FSMContext):
     await state.update_data(order=order)
     await state.set_state(OrderForm.date)
 
-    # Показать календарь
     today = date.today()
     await message.answer("Выберите *дату подачи*:", parse_mode="Markdown", reply_markup=date_calendar_kb(today.year, today.month))
 
