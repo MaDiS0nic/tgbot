@@ -44,7 +44,7 @@ TARIFFS = {
     "minivan": {"title": "Минивэн (5-6 чел)", "per_km": 50},
 }
 
-# ================== ФИКСИРОВАННЫЕ ГОРОДА (фрагмент, оставлены ключевые + обновлённые) ==================
+# ================== ФИКСИРОВАННЫЕ ГОРОДА (с выжимкой и обновлениями) ==================
 FIXED: Dict[str, Dict[str, int]] = {
     "Железноводск": {"econom": 800, "camry": 1500, "minivan": 2000},
     "Пятигорск": {"econom": 1200, "camry": 1500, "minivan": 1900},
@@ -52,7 +52,6 @@ FIXED: Dict[str, Dict[str, int]] = {
     "Георгиевск": {"econom": 1300, "camry": 2000, "minivan": 2500},
     "Кисловодск": {"econom": 1800, "camry": 2500, "minivan": 3000},
 
-    # обновлённые направления
     "Архыз": {"econom": 6500, "camry": 8000, "minivan": 10000},
     "Архыз Романтик": {"econom": 7000, "camry": 9000, "minivan": 11000},
     "Домбай": {"econom": 6500, "camry": 8000, "minivan": 10000},
@@ -83,7 +82,6 @@ CITY_SYNONYMS: Dict[str, str] = {
     "аэропорт мрв": "Аэропорт MRV",
     "минводы аэропорт": "Аэропорт MRV",
     "минеральные воды аэропорт": "Аэропорт MRV",
-    "минеральные воды (аэропорт)": "Аэропорт MRV",
     "минводы": "Железноводск",
     "минеральные воды": "Железноводск",
     "эльбрус азау": "Азау",
@@ -116,13 +114,6 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         is_persistent=True,
     )
 
-def dispatcher_inline_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💬 Написать диспетчеру в Telegram", url="https://t.me/zhelektown")
-    ], [
-        InlineKeyboardButton(text="📱 Позвонить диспетчеру", url="tel:+79340241414")
-    ]])
-
 def quick_cities_kb() -> ReplyKeyboardMarkup:
     rows = []
     row = []
@@ -133,6 +124,14 @@ def quick_cities_kb() -> ReplyKeyboardMarkup:
     if row: rows.append(row)
     rows.append([KeyboardButton(text="⬅️ В меню")])
     return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=rows)
+
+def dispatcher_inline_kb() -> InlineKeyboardMarkup:
+    # Никаких tel: — Telegram их не принимает в инлайн-кнопках
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 Написать диспетчеру в Telegram", url="https://t.me/zhelektown")
+    ], [
+        InlineKeyboardButton(text="📱 Показать номер телефона", callback_data="dispatcher_phone")
+    ]])
 
 def confirm_order_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -236,7 +235,7 @@ def prices_text(prices: Dict[str, int]) -> str:
 
 PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{8,}$")
 
-# ================== КАЛЕНДАРЬ ==================
+# ================== КАЛЕНДАРЬ/ВРЕМЯ ==================
 def calendar_kb(target: date) -> InlineKeyboardMarkup:
     y, m = target.year, target.month
     month_name = calendar.month_name[m]
@@ -299,10 +298,10 @@ async def on_big_start(message: Message, state: FSMContext):
 # ---- ИНФОРМАЦИЯ ----
 @dp.message(F.text == "ℹ️ Информация")
 async def on_info(message: Message):
+    # Для кликабельности в Telegram достаточно вывести номер формата +7...
     html = (
         "<b>TransferAir</b> — междугороднее такси (трансфер) из Минеральных Вод.\n\n"
-        "Можете заказать трансфер через бота, "
-        "позвонить нам <a href=\"tel:+79340241414\">+7 934 024-14-14</a>, "
+        "Можете заказать трансфер через бота, позвонить нам +7 934 024-14-14, "
         "или посетить наш сайт: <a href=\"https://transferkmw.ru\">transferkmw.ru</a>"
     )
     await message.answer(html, parse_mode="HTML", disable_web_page_preview=True)
@@ -313,9 +312,15 @@ async def on_dispatcher(message: Message):
     text = (
         "☎️ <b>Связаться с диспетчером</b>\n\n"
         "Нажмите кнопку ниже, чтобы написать диспетчеру в Telegram\n"
-        "или позвонить по телефону."
+        "или получить номер телефона для звонка."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=dispatcher_inline_kb())
+
+@dp.callback_query(F.data == "dispatcher_phone")
+async def dispatcher_phone_cb(cb: CallbackQuery):
+    # Просто отправляем номер — Telegram сам делает его кликабельным
+    await cb.message.answer("+7 934 024-14-14")
+    await cb.answer("Номер отправлен")
 
 # ---- КАЛЬКУЛЯТОР ----
 @dp.message(F.text == "🧮 Калькулятор стоимости")
@@ -394,15 +399,14 @@ async def order_to_city(message: Message, state: FSMContext):
     await message.answer("Выберите <b>дату подачи</b>:", parse_mode="HTML",
                          reply_markup=calendar_kb(date.today()))
 
-# --- Календарь: заглушка на не-кликабельные кнопки ---
+# --- Календарь заглушка ---
 @dp.callback_query(F.data == "noop")
 async def noop_cb(cb: CallbackQuery):
     await cb.answer()
 
-# --- Календарь: навигация по месяцам ---
+# --- Календарь навигация ---
 @dp.callback_query(F.data.startswith("calnav:"))
 async def calendar_nav_cb(cb: CallbackQuery):
-    # Безопасный парсер: calnav:YYYY-MM
     payload = cb.data.split(":", 1)[1] if ":" in cb.data else ""
     parts = payload.split("-")
     if len(parts) != 2:
@@ -415,10 +419,9 @@ async def calendar_nav_cb(cb: CallbackQuery):
         pass
     await cb.answer()
 
-# --- Календарь: выбор даты ---
+# --- Выбор даты ---
 @dp.callback_query(F.data.startswith("cal:"))
 async def calendar_pick_cb(cb: CallbackQuery, state: FSMContext):
-    # Формат: cal:YYYY-MM-DD
     payload = cb.data.split(":", 1)[1] if ":" in cb.data else ""
     try:
         chosen = date.fromisoformat(payload)
@@ -488,10 +491,9 @@ async def order_comment(message: Message, state: FSMContext):
 async def proceed_to_confirm(msg: Message, state: FSMContext):
     data = await state.get_data(); order = data.get("order", {})
     prices = await estimate_prices(order["from_city"], order["to_city"])
-    price_txt = prices_text(prices) if prices else "Предварительную стоимость сейчас посчитать не удалось."
 
-    txt = (
-        f"{price_txt}\n\n"
+    # СТОИМОСТЬ — ВНИЗУ, как просил
+    details = (
         f"Проверьте данные заказа:\n\n"
         f"Откуда: <b>{order['from_city']}</b>\n"
         f"Куда: <b>{order['to_city']}</b>\n"
@@ -499,8 +501,10 @@ async def proceed_to_confirm(msg: Message, state: FSMContext):
         f"Время: <b>{order['time']}</b>\n"
         f"Пассажиров: <b>{order.get('people','—')}</b>\n"
         f"Комментарий: {order.get('comment') or '—'}\n\n"
-        "Подтвердить?"
     )
+    price_txt = prices_text(prices) if prices else "Предварительную стоимость сейчас посчитать не удалось."
+
+    txt = details + price_txt + "\n\nПодтвердить?"
     await state.set_state(OrderStates.confirm)
     await msg.answer(txt, parse_mode="HTML", reply_markup=confirm_order_kb())
 
