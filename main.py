@@ -47,7 +47,7 @@ BTN_INFO = "ℹ️ Информация"
 
 MENU_BUTTONS = [BTN_CALC, BTN_ORDER, BTN_DISPATCHER, BTN_INFO]
 
-# ================== ТАРИФЫ (пер.км для городов без фикса) ==================
+# ================== ТАРИФЫ ==================
 TARIFFS = {
     "econom":  {"title": "Легковой",            "per_km": 30},
     "camry":   {"title": "Camry",               "per_km": 40},
@@ -61,7 +61,6 @@ FIXED_PRICES: Dict[str, Tuple[int, int, int]] = {
     "ессентуки": (1300, 2000, 2500),
     "кисловодск": (1800, 2500, 3000),
 
-    # обновлённые блоки
     "архыз": (6500, 8000, 10000),
     "архыз романтик": (7000, 9000, 11000),
     "домбай": (6500, 8000, 10000),
@@ -205,6 +204,16 @@ def resolve_from_city(text: str) -> str:
     key = _norm_key(text)
     return FROM_ALIASES.get(key, normalize_city(text))
 
+def guess_from_display(text: str) -> str:
+    """Определяет отображаемое название отправления по вводу пользователя."""
+    key = _norm_key(text)
+    if "аэропорт" in key or "mrv" in key:
+        return "Аэропорт MRV"
+    # если пользователь явно написал ровно "аэропорт mrv"
+    if key in {"аэропорт mrv", "аэропорт мв"}:
+        return "Аэропорт MRV"
+    return "Минеральные Воды"
+
 def resolve_dest_key(text: str) -> str:
     key = _norm_key(text)
     if key in FIXED_PRICES:
@@ -245,11 +254,17 @@ DEST_OPTIONS: List[Tuple[str, str]] = [
     ("Дербент", "дербент"),
 ]
 
+# ---- компактные callback'и для from_pick ----
+FROM_CHOICES = {
+    # key: (canonical_from, display_from)
+    "mv":  ("Минеральные Воды", "Минеральные Воды"),
+    "mrv": ("Минеральные Воды", "Аэропорт MRV"),
+}
+
 def from_suggestions_kb() -> InlineKeyboardMarkup:
-    # callback формат: from_pick:<canonical>|<display>
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Минеральные Воды", callback_data="from_pick:Минеральные Воды|Минеральные Воды"),
-        InlineKeyboardButton(text="Аэропорт MRV",    callback_data="from_pick:Минеральные Воды|Аэропорт MRV"),
+        InlineKeyboardButton(text="Минеральные Воды", callback_data="fp:mv"),
+        InlineKeyboardButton(text="Аэропорт MRV",    callback_data="fp:mrv"),
     ]])
 
 def dest_suggestions_kb(page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
@@ -462,14 +477,12 @@ def per_km_prices(distance_km: float) -> Tuple[int, int, int]:
     return p_e, p_c, p_m
 
 async def compute_prices_for_order(from_city: str, to_city: str) -> Optional[Tuple[int, int, int, str]]:
-    """Возвращает (e,c,m, 'fixed'|'distance') или None, если геокодинг не удался."""
     from_key = _norm_key(from_city)
     to_key = resolve_dest_key(to_city)
     if from_key == "минеральные воды" and to_key in FIXED_PRICES:
         e, c, m = FIXED_PRICES[to_key]
         return e, c, m, "fixed"
 
-    # по расстоянию
     async with aiohttp.ClientSession() as session:
         a = await geocode_city(session, from_city)
         b = await geocode_city(session, to_city)
@@ -516,8 +529,6 @@ async def menu_router(message: Message, state: FSMContext):
             "📞 Позвонить нам: +79340241414\n\n"
             "🌐 Посетить наш сайт: https://transferkmw.ru/",
         )
-        # Кликабельный номер – контакт
-        await bot.send_contact(message.chat.id, DISPATCHER_PHONE, DISPATCHER_NAME)
         return
 
 # ================== START ==================
@@ -551,7 +562,6 @@ async def on_dispatcher(message: Message):
 
 @dp.callback_query(F.data == "dispatcher_phone")
 async def dispatcher_phone_cb(cb: CallbackQuery):
-    # Только контакт — без дублей номера
     await bot.send_contact(
         chat_id=cb.message.chat.id,
         phone_number=DISPATCHER_PHONE,
@@ -560,29 +570,27 @@ async def dispatcher_phone_cb(cb: CallbackQuery):
     await cb.answer("Контакт отправлен")
 
 # ================== ПОДХВАТ FROM/TO ПОДСКАЗОК ==================
-@dp.callback_query(F.data.startswith("from_pick:"))
+@dp.callback_query(F.data.startswith("fp:"))
 async def pick_from(cb: CallbackQuery, state: FSMContext):
-    payload = cb.data.split(":", 1)[1]               # "Минеральные Воды|Аэропорт MRV" или "Минеральные Воды|Минеральные Воды"
-    canonical, display = payload.split("|", 1)
-    from_city = canonical
-    from_display = display
+    key = cb.data.split(":", 1)[1]  # mv | mrv
+    canonical, display = FROM_CHOICES.get(key, ("Минеральные Воды", "Минеральные Воды"))
 
     current = await state.get_state()
     if current and current.endswith("from_city"):
         if current.startswith("CalcStates"):
-            await state.update_data(from_city=from_city, from_display=from_display)
+            await state.update_data(from_city=canonical, from_display=display)
             await state.set_state(CalcStates.to_city)
             await cb.message.edit_text(
-                f"Отправление: *{from_display}* ✅\nВведите *город прибытия* (или выберите ниже):",
+                f"Отправление: *{display}* ✅\nВведите *город прибытия* (или выберите ниже):",
                 parse_mode="Markdown"
             )
             await cb.message.answer("Быстрый выбор:", reply_markup=dest_suggestions_kb(0))
         else:
-            order = {"from_city": from_city, "from_display": from_display}
+            order = {"from_city": canonical, "from_display": display}
             await state.update_data(order=order)
             await state.set_state(OrderForm.to_city)
             await cb.message.edit_text(
-                f"Отправление: *{from_display}* ✅\nВведите *город прибытия* (или выберите ниже):",
+                f"Отправление: *{display}* ✅\nВведите *город прибытия* (или выберите ниже):",
                 parse_mode="Markdown"
             )
             await cb.message.answer("Быстрый выбор:", reply_markup=dest_suggestions_kb(0))
@@ -600,24 +608,24 @@ async def dest_page(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("dest_pick:"))
 async def dest_pick(cb: CallbackQuery, state: FSMContext):
     key = cb.data.split(":", 1)[1]
-    display = next((d for d, k in DEST_OPTIONS if k == key), key.title())
+    display_dest = next((d for d, k in DEST_OPTIONS if k == key), key.title())
 
     try:
         current = await state.get_state()
         if current and current.endswith("to_city"):
+            # ---- КАЛЬКУЛЯТОР ----
             if current.startswith("CalcStates"):
                 data = await state.get_data()
                 from_city = data.get("from_city") or "Минеральные Воды"
-                from_display = data.get("from_display") or from_city
-
+                from_display = data.get("from_display") or "Минеральные Воды"
                 await state.clear()
 
-                if key in FIXED_PRICES and _norm_key(from_city) in {"минеральные воды"}:
+                if key in FIXED_PRICES and _norm_key(from_city) == "минеральные воды":
                     e, c, m = FIXED_PRICES[key]
                     txt = (
                         "⚠️ *Стоимость предварительная, окончательная цена оговаривается с диспетчером!*\n\n"
                         f"🧮 *Калькулятор стоимости*\n\n"
-                        f"Из: *{from_display}*\nВ: *{display}*\n\n"
+                        f"Из: *{from_display}*\nВ: *{display_dest}*\n\n"
                         f"{prices_text_total_only(e, c, m)}"
                     )
                     await cb.message.edit_text(txt, parse_mode="Markdown")
@@ -627,7 +635,7 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
 
                 async with aiohttp.ClientSession() as session:
                     a = await geocode_city(session, from_city)
-                    b = await geocode_city(session, display)
+                    b = await geocode_city(session, display_dest)
                 if not a or not b:
                     await cb.message.answer("❌ Не удалось определить города. Попробуйте ещё раз.")
                     await cb.answer()
@@ -637,7 +645,7 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
                 txt = (
                     "⚠️ *Стоимость предварительная, окончательная цена оговаривается с диспетчером!*\n\n"
                     f"🧮 *Калькулятор стоимости*\n\n"
-                    f"Из: *{from_display}*\nВ: *{display}*\n\n"
+                    f"Из: *{from_display}*\nВ: *{display_dest}*\n\n"
                     f"{prices_text_total_only(p_e, p_c, p_m)}"
                 )
                 await cb.message.edit_text(txt, parse_mode="Markdown")
@@ -645,17 +653,17 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
                 await cb.answer()
                 return
 
+            # ---- ЗАКАЗ ----
             else:
                 data = await state.get_data()
                 order = data.get("order", {})
-                order["to_city"] = display
+                order["to_city"] = display_dest
                 await state.update_data(order=order)
                 await state.set_state(OrderForm.date)
 
-                # показать календарь выбора даты
                 today = date.today()
                 await cb.message.edit_text(
-                    f"Направление: *{display}* ✅\n\nВыберите *дату подачи*:",
+                    f"Направление: *{display_dest}* ✅\n\nВыберите *дату подачи*:",
                     parse_mode="Markdown"
                 )
                 await cb.message.answer("Календарь:", reply_markup=date_calendar_kb(today.year, today.month))
@@ -753,15 +761,10 @@ async def geocode_pair(from_city: str, to_city: str) -> Optional[Tuple[Dict[str,
 
 @dp.message(CalcStates.from_city, F.text)
 async def calc_from_city(message: Message, state: FSMContext):
-    raw = normalize_city(message.text)
-    from_city = resolve_from_city(raw)
-    from_display = raw if _norm_key(raw) not in {"минеральные воды", "аэропорт mrv"} else ("Аэропорт MRV" if "mrv" in _norm_key(raw) else "Минеральные Воды")
-    if _norm_key(raw) in {"аэропорт mrv", "аэропорт мв"}:
-        from_display = "Аэропорт MRV"
-    if _norm_key(raw) in {"минеральные воды", "минводы", "мв", "мвр"}:
-        from_display = "Минеральные Воды"
-
-    await state.update_data(from_city=from_city, from_display=from_display)
+    from_city_input = normalize_city(message.text)
+    from_city_canon = resolve_from_city(from_city_input)
+    from_display = guess_from_display(from_city_input) if _norm_key(from_city_canon) == "минеральные воды" else from_city_canon
+    await state.update_data(from_city=from_city_canon, from_display=from_display)
     await state.set_state(CalcStates.to_city)
     await message.answer("Введите *город прибытия* (или выберите ниже):", parse_mode="Markdown")
     await message.answer("Быстрый выбор:", reply_markup=dest_suggestions_kb(0))
@@ -772,11 +775,11 @@ async def calc_to_city(message: Message, state: FSMContext):
         to_raw = normalize_city(message.text)
         data = await state.get_data()
         from_city = data.get("from_city") or "Минеральные Воды"
-        from_display = data.get("from_display") or from_city
+        from_display = data.get("from_display") or "Минеральные Воды"
 
         to_key = resolve_dest_key(to_raw)
 
-        if to_key in FIXED_PRICES and _norm_key(from_city) in {"минеральные воды"}:
+        if to_key in FIXED_PRICES and _norm_key(from_city) == "минеральные воды":
             e, c, m = FIXED_PRICES[to_key]
             txt = (
                 "⚠️ *Стоимость предварительная, окончательная цена оговаривается с диспетчером!*\n\n"
@@ -809,19 +812,13 @@ async def calc_to_city(message: Message, state: FSMContext):
         await message.answer("Произошла ошибка при расчёте. Попробуйте ещё раз.", reply_markup=main_menu_kb())
         await state.clear()
 
-# ---- СДЕЛАТЬ ЗАКАЗ ----
+# ---- СДЕЛАТЬ ЗАКАЗ (ручной ввод + календарь + время + пассажиры + комментарий по выбору) ----
 @dp.message(OrderForm.from_city, F.text)
 async def order_from_city(message: Message, state: FSMContext):
-    raw = normalize_city(message.text)
-    order = {"from_city": resolve_from_city(raw)}
-    # отображаемое имя (если ввели MRV)
-    if _norm_key(raw) in {"аэропорт mrv", "аэропорт мв", "mrv"}:
-        order["from_display"] = "Аэропорт MRV"
-    elif _norm_key(raw) in {"минеральные воды", "минводы", "мв", "мвр"}:
-        order["from_display"] = "Минеральные Воды"
-    else:
-        order["from_display"] = order["from_city"]
-
+    from_city_input = normalize_city(message.text)
+    from_city_canon = resolve_from_city(from_city_input)
+    from_display = guess_from_display(from_city_input) if _norm_key(from_city_canon) == "минеральные воды" else from_city_canon
+    order = {"from_city": from_city_canon, "from_display": from_display}
     await state.update_data(order=order)
     await state.set_state(OrderForm.to_city)
     await message.answer("Введите *город прибытия* (или выберите ниже):", parse_mode="Markdown")
@@ -920,19 +917,16 @@ async def order_phone(message: Message, state: FSMContext):
     order["phone"] = phone
     await state.update_data(order=order)
 
-    # Считаем ориентировочную стоимость
     prices = await compute_prices_for_order(order.get("from_city",""), order.get("to_city",""))
     if prices is None:
         price_block = "💰 Стоимость: не удалось ориентировочно рассчитать (уточнит диспетчер)."
     else:
-        e, c, m, mode = prices
+        e, c, m, _ = prices
         price_block = prices_text_total_only(e, c, m)
-
-    show_from = order.get("from_display") or order.get("from_city","")
 
     txt = (
         f"Проверьте данные заказа:\n\n"
-        f"Откуда: *{show_from}*\n"
+        f"Откуда: *{order.get('from_display', order.get('from_city',''))}*\n"
         f"Куда: *{order.get('to_city','')}*\n"
         f"Дата: *{order.get('date','')}*\n"
         f"Время: *{order.get('time','')}*\n"
@@ -959,7 +953,6 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
         await state.clear()
         await cb.message.edit_text("Изменим заказ. Введите снова город отправления (или выберите ниже):")
         await state.set_state(OrderForm.from_city)
-        # сразу быстрые кнопки
         await bot.send_message(cb.message.chat.id, "Быстрый выбор:", reply_markup=from_suggestions_kb())
         await cb.answer()
         return
@@ -971,7 +964,6 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
     await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
     await cb.answer("Заявка отправлена")
 
-    # уведомление админу с ориент. ценой
     price_text = ""
     prices = await compute_prices_for_order(order.get("from_city",""), order.get("to_city",""))
     if prices is not None:
@@ -981,10 +973,9 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
     if ADMIN_CHAT_ID:
         try:
             user = cb.from_user
-            show_from = order.get("from_display") or order.get("from_city","")
             txt = (
                 f"🆕 *Заявка на заказ*\n\n"
-                f"От: *{show_from}* → *{order.get('to_city','')}*\n"
+                f"От: *{order.get('from_display', order.get('from_city',''))}* → *{order.get('to_city','')}*\n"
                 f"Дата: *{order.get('date','')}*, Время: *{order.get('time','')}*\n"
                 f"Пассажиров: *{order.get('pax','')}*\n"
                 f"Телефон: *{order.get('phone','')}*\n"
@@ -996,7 +987,7 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
         except Exception as e:
             logger.warning(f"Failed to notify admin: {e}")
 
-# ---- ИНФОРМАЦИЯ (дубликатор на случай прямого вызова) ----
+# ---- ИНФОРМАЦИЯ ----
 @dp.message(F.text == BTN_INFO)
 async def info_handler(message: Message):
     await message.answer(
@@ -1005,7 +996,6 @@ async def info_handler(message: Message):
         "📞 Позвонить нам: +79340241414\n\n"
         "🌐 Посетить наш сайт: https://transferkmw.ru/",
     )
-    await bot.send_contact(message.chat.id, DISPATCHER_PHONE, DISPATCHER_NAME)
 
 # ================== FASTAPI + WEBHOOK ==================
 app = FastAPI()
