@@ -158,16 +158,20 @@ FIXED_PRICES: Dict[str, Tuple[int, int, int]] = {
 }
 
 # ================== АЛИАСЫ/СИНОНИМЫ ==================
+# ВАЖНО: теперь различаем "Минеральные Воды" и "Аэропорт MRV"
 FROM_ALIASES = {
+    # Минеральные Воды (город)
     "минводы": "Минеральные Воды",
     "минеральные воды": "Минеральные Воды",
-    "минеральные воды аэропорт": "Минеральные Воды",
-    "аэропорт минеральные воды": "Минеральные Воды",
-    "аэропорт мв": "Минеральные Воды",
-    "аэропорт mrv": "Минеральные Воды",
     "мв": "Минеральные Воды",
-    "мвр": "Минеральные Воды",
-    "mrv": "Минеральные Воды",
+
+    # Аэропорт MRV (аэропорт)
+    "аэропорт мв": "Аэропорт MRV",
+    "аэропорт mrv": "Аэропорт MRV",
+    "аэропорт минеральные воды": "Аэропорт MRV",
+    "минеральные воды аэропорт": "Аэропорт MRV",
+    "аэропорт": "Аэропорт MRV",
+    "mrv": "Аэропорт MRV",
 }
 DEST_ALIASES = {
     "железка": "железноводск",
@@ -246,7 +250,7 @@ DEST_OPTIONS: List[Tuple[str, str]] = [
 def from_suggestions_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Минеральные Воды", callback_data="from_pick:Минеральные Воды"),
-        InlineKeyboardButton(text="Аэропорт MRV", callback_data="from_pick:Минеральные Воды"),
+        InlineKeyboardButton(text="Аэропорт MRV", callback_data="from_pick:Аэропорт MRV"),
     ]])
 
 def dest_suggestions_kb(page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
@@ -462,7 +466,8 @@ async def compute_prices_for_order(from_city: str, to_city: str) -> Optional[Tup
     """Возвращает (e,c,m, 'fixed'|'distance') или None, если геокодинг не удался."""
     from_key = _norm_key(from_city)
     to_key = resolve_dest_key(to_city)
-    if from_key == "минеральные воды" and to_key in FIXED_PRICES:
+    # Фикс — для Минеральные Воды и Аэропорт MRV
+    if from_key in {"минеральные воды", "аэропорт mrv"} and to_key in FIXED_PRICES:
         e, c, m = FIXED_PRICES[to_key]
         return e, c, m, "fixed"
 
@@ -508,9 +513,9 @@ async def menu_router(message: Message, state: FSMContext):
 
     if text == BTN_INFO:
         await message.answer(
-            "🧳 TransferAir междугороднее такси (Трансфер) из Минеральных Вод.\n"
-            "🤖 Вы можете заказать трансфер через бота.\n"
-            "📞 Позвонить нам: +79340241414\n"
+            "🛫 TransferAir междугороднее такси (Трансфер) из Минеральных Вод.\n\n"
+            "🤖 Вы можете заказать трансфер через бота.\n\n"
+            "📞 Позвонить нам: +7 934 024-14-14\n\n"
             "🌐 Посетить наш сайт: https://transferkmw.ru/",
         )
         return
@@ -546,11 +551,9 @@ async def on_dispatcher(message: Message):
 
 @dp.callback_query(F.data == "dispatcher_phone")
 async def dispatcher_phone_cb(cb: CallbackQuery):
+    # Отправляем телефон простым текстом, чтобы Telegram сделал его кликабельным
     await cb.message.answer(
-        "📱 Телефон диспетчера:\n"
-        "`+7 934 024-14-14`\n\n"
-        "Скопируйте номер и позвоните вручную.",
-        parse_mode="Markdown",
+        "📞 Позвонить нам:\n+7 934 024-14-14"
     )
     await cb.answer("Номер отправлен")
 
@@ -599,21 +602,23 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
             if current.startswith("CalcStates"):
                 data = await state.get_data()
                 from_city = data.get("from_city") or "Минеральные Воды"
-                await state.clear()
 
-                if key in FIXED_PRICES and _norm_key(from_city) in {"минеральные воды"}:
+                # FIXED для обеих отправных точек
+                if key in FIXED_PRICES and _norm_key(from_city) in {"минеральные воды", "аэропорт mrv"}:
                     e, c, m = FIXED_PRICES[key]
                     txt = (
                         "⚠️ *Стоимость предварительная, окончательная цена оговаривается с диспетчером!*\n\n"
                         f"🧮 *Калькулятор стоимости*\n\n"
-                        f"Из: *Минеральные Воды*\nВ: *{display}*\n\n"
+                        f"Из: *{from_city}*\nВ: *{display}*\n\n"
                         f"{prices_text_total_only(e, c, m)}"
                     )
                     await cb.message.edit_text(txt, parse_mode="Markdown")
                     await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
+                    await state.clear()
                     await cb.answer()
                     return
 
+                # иначе — по расстоянию
                 async with aiohttp.ClientSession() as session:
                     a = await geocode_city(session, from_city)
                     b = await geocode_city(session, display)
@@ -631,6 +636,7 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
                 )
                 await cb.message.edit_text(txt, parse_mode="Markdown")
                 await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
+                await state.clear()
                 await cb.answer()
                 return
 
@@ -759,12 +765,12 @@ async def calc_to_city(message: Message, state: FSMContext):
 
         to_key = resolve_dest_key(to_raw)
 
-        if to_key in FIXED_PRICES and _norm_key(from_city) in {"минеральные воды"}:
+        if to_key in FIXED_PRICES and _norm_key(from_city) in {"минеральные воды", "аэропорт mrv"}:
             e, c, m = FIXED_PRICES[to_key]
             txt = (
                 "⚠️ *Стоимость предварительная, окончательная цена оговаривается с диспетчером!*\n\n"
                 f"🧮 *Калькулятор стоимости*\n\n"
-                f"Из: *Минеральные Воды*\nВ: *{to_raw}*\n\n"
+                f"Из: *{from_city}*\nВ: *{to_raw}*\n\n"
                 f"{prices_text_total_only(e, c, m)}"
             )
             await message.answer(txt, parse_mode="Markdown", reply_markup=main_menu_kb())
@@ -932,9 +938,11 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
         await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
         return
     if action == "order_edit":
+        # Возврат к вводу "Откуда" с быстрыми кнопками
         await state.clear()
-        await cb.message.edit_text("Изменим заказ. Введите снова город отправления:")
         await state.set_state(OrderForm.from_city)
+        await cb.message.edit_text("Изменим заказ. Введите *город отправления* (или выберите ниже):", parse_mode="Markdown")
+        await bot.send_message(cb.message.chat.id, "Быстрый выбор:", reply_markup=from_suggestions_kb())
         await cb.answer()
         return
 
@@ -973,9 +981,9 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
 @dp.message(F.text == BTN_INFO)
 async def info_handler(message: Message):
     await message.answer(
-        "🧳 TransferAir междугороднее такси (Трансфер) из Минеральных Вод.\n"
-        "🤖 Вы можете заказать трансфер через бота.\n"
-        "📞 Позвонить нам: +79340241414\n"
+        "🛫 TransferAir междугороднее такси (Трансфер) из Минеральных Вод.\n\n"
+        "🤖 Вы можете заказать трансфер через бота.\n\n"
+        "📞 Позвонить нам: +7 934 024-14-14\n\n"
         "🌐 Посетить наш сайт: https://transferkmw.ru/",
     )
 
