@@ -6,7 +6,7 @@ import logging
 import re
 import calendar
 from datetime import datetime, date, timedelta
-from typing import Final, Dict, Optional, Tuple
+from typing import Final, Dict, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, F
@@ -38,24 +38,21 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ================== ТАРИФЫ ==================
-# Базовые тарифы (для расчёта по километражу, если нет фиксированного города)
 TARIFFS = {
     "econom":  {"title": "Легковой",          "per_km": 30},
     "camry":   {"title": "Camry",             "per_km": 40},
     "minivan": {"title": "Минивэн (5-6 чел)", "per_km": 50},
 }
 
-# ================== ФИКСИРОВАННЫЕ ГОРОДА ==================
-# Вводите здесь любые обновления цен. Ключи — каноническое название города.
+# ================== ФИКСИРОВАННЫЕ ГОРОДА (фрагмент, оставлены ключевые + обновлённые) ==================
 FIXED: Dict[str, Dict[str, int]] = {
-    # Ближние
     "Железноводск": {"econom": 800, "camry": 1500, "minivan": 2000},
     "Пятигорск": {"econom": 1200, "camry": 1500, "minivan": 1900},
     "Ессентуки": {"econom": 1300, "camry": 2000, "minivan": 2500},
     "Георгиевск": {"econom": 1300, "camry": 2000, "minivan": 2500},
     "Кисловодск": {"econom": 1800, "camry": 2500, "minivan": 3000},
 
-    # Обновлённые направления (горный кластер)
+    # обновлённые направления
     "Архыз": {"econom": 6500, "camry": 8000, "minivan": 10000},
     "Архыз Романтик": {"econom": 7000, "camry": 9000, "minivan": 11000},
     "Домбай": {"econom": 6500, "camry": 8000, "minivan": 10000},
@@ -68,38 +65,32 @@ FIXED: Dict[str, Dict[str, int]] = {
     "Байдаево": {"econom": 5000, "camry": 7500, "minivan": 9000},
     "Чегет": {"econom": 5500, "camry": 7500, "minivan": 9000},
 
-    # Примеры дальних (оставил часть списка; при необходимости дополняйте)
     "Ставрополь": {"econom": 5400, "camry": 7200, "minivan": 9000},
     "Черкесск": {"econom": 3000, "camry": 4000, "minivan": 5000},
     "Нальчик": {"econom": 3300, "camry": 4400, "minivan": 5500},
     "Владикавказ": {"econom": 6600, "camry": 8800, "minivan": 11000},
     "Назрань": {"econom": 6600, "camry": 8800, "minivan": 11000},
     "Магас": {"econom": 6600, "camry": 8800, "minivan": 11000},
-    "Светлоград": {"econom": 5100, "camry": 6800, "minivan": 8500},
     "Краснодар": {"econom": 12000, "camry": 16000, "minivan": 20000},
     "Сочи": {"econom": 16500, "camry": 22000, "minivan": 27500},
     "Адлер": {"econom": 17400, "camry": 23200, "minivan": 29000},
     "Новороссийск": {"econom": 17000, "camry": 22600, "minivan": 28200},
 }
 
-# ================== СИНОНИМЫ ГОРОДОВ ==================
-# Ключ — то, как пользователь пишет; значение — каноническое имя из FIXED
+# ================== СИНОНИМЫ ==================
 CITY_SYNONYMS: Dict[str, str] = {
     "мвр": "Аэропорт MRV",
     "аэропорт мрв": "Аэропорт MRV",
     "минводы аэропорт": "Аэропорт MRV",
     "минеральные воды аэропорт": "Аэропорт MRV",
     "минеральные воды (аэропорт)": "Аэропорт MRV",
-    "минеральные воды": "Железноводск",  # частая путаница, можно сменить при желании
     "минводы": "Железноводск",
-    # Горный кластер
+    "минеральные воды": "Железноводск",
     "эльбрус азау": "Азау",
     "глк эльбрус": "Азау",
     "чегет поляна": "Чегет",
-    # и т.п. — можно расширять
 }
 
-# Быстрые подсказки городов (на клавиатуре)
 QUICK_CITIES = [
     "Аэропорт MRV", "Железноводск", "Пятигорск",
     "Ессентуки", "Кисловодск", "Архыз", "Домбай",
@@ -127,15 +118,9 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 def dispatcher_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="💬 Написать диспетчеру в Telegram",
-            url="https://t.me/zhelektown"   # обновлённый юзернейм
-        )
+        InlineKeyboardButton(text="💬 Написать диспетчеру в Telegram", url="https://t.me/zhelektown")
     ], [
-        InlineKeyboardButton(
-            text="📱 Позвонить диспетчеру",
-            url="tel:+79340241414"
-        )
+        InlineKeyboardButton(text="📱 Позвонить диспетчеру", url="tel:+79340241414")
     ]])
 
 def quick_cities_kb() -> ReplyKeyboardMarkup:
@@ -194,20 +179,19 @@ def canon_city(name: str) -> str:
     key = norm(name)
     if key in CITY_SYNONYMS:
         return CITY_SYNONYMS[key]
-    # точное совпадение из FIXED
     for city in list(FIXED.keys()) + QUICK_CITIES:
         if norm(city) == key:
             return city
-    # иначе вернуть исходник с нормализацией регистра
     return name.strip()
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb/2) ** 2
-    return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+    from math import radians, sin, cos, atan2, sqrt
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlmb = radians(lon2 - lon1)
+    a = sin(dphi/2) ** 2 + cos(phi1) * cos(phi2) * sin(dlmb/2) ** 2
+    return R * (2 * atan2(sqrt(a), sqrt(1 - a)))
 
 async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Dict[str, float]]:
     url = "https://nominatim.openstreetmap.org/search"
@@ -226,15 +210,9 @@ async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Di
         return None
 
 async def estimate_prices(from_city: str, to_city: str) -> Optional[Dict[str, int]]:
-    """
-    Возвращает словарь с ценами по тарифам (econom, camry, minivan).
-    Если есть фикс — используем его; иначе считаем по расстоянию.
-    """
     to_c = canon_city(to_city)
     if to_c in FIXED:
         return FIXED[to_c].copy()
-
-    # расчёт по километражу
     async with aiohttp.ClientSession() as session:
         a = await geocode_city(session, from_city)
         b = await geocode_city(session, to_city)
@@ -258,7 +236,7 @@ def prices_text(prices: Dict[str, int]) -> str:
 
 PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{8,}$")
 
-# ================== КАЛЕНДАРЬ (Inline) ==================
+# ================== КАЛЕНДАРЬ ==================
 def calendar_kb(target: date) -> InlineKeyboardMarkup:
     y, m = target.year, target.month
     month_name = calendar.month_name[m]
@@ -278,7 +256,6 @@ def calendar_kb(target: date) -> InlineKeyboardMarkup:
                 else:
                     row.append(InlineKeyboardButton(text=str(d), callback_data=f"cal:{y}-{m:02d}-{d:02d}"))
         buttons.append(row)
-    # навигация
     prev_month = (target.replace(day=1) - timedelta(days=1)).replace(day=1)
     next_month = (target.replace(day=28) + timedelta(days=4)).replace(day=1)
     buttons.append([
@@ -322,7 +299,6 @@ async def on_big_start(message: Message, state: FSMContext):
 # ---- ИНФОРМАЦИЯ ----
 @dp.message(F.text == "ℹ️ Информация")
 async def on_info(message: Message):
-    # Телефон как кликабельная ссылка tel:+7..., как вы просили
     html = (
         "<b>TransferAir</b> — междугороднее такси (трансфер) из Минеральных Вод.\n\n"
         "Можете заказать трансфер через бота, "
@@ -341,21 +317,7 @@ async def on_dispatcher(message: Message):
     )
     await message.answer(text, parse_mode="HTML", reply_markup=dispatcher_inline_kb())
 
-@dp.callback_query(F.data == "dispatcher_phone")
-async def dispatcher_phone_cb(cb: CallbackQuery):
-    await cb.message.answer(
-        "📱 Телефон диспетчера:\n"
-        "<a href=\"tel:+79340241414\">+7 934 024-14-14</a>\n\n"
-        "Нажмите, чтобы позвонить.",
-        parse_mode="HTML",
-    )
-    await cb.answer("Номер отправлен")
-
 # ---- КАЛЬКУЛЯТОР ----
-class CalcStates(StatesGroup):
-    from_city = State()
-    to_city = State()
-
 @dp.message(F.text == "🧮 Калькулятор стоимости")
 async def calc_start(message: Message, state: FSMContext):
     await state.clear()
@@ -365,10 +327,10 @@ async def calc_start(message: Message, state: FSMContext):
 
 @dp.message(CalcStates.from_city, F.text)
 async def calc_from_city(message: Message, state: FSMContext):
-    city = canon_city(message.text)
     if message.text == "⬅️ В меню":
         await state.clear()
         await message.answer("Вы в главном меню:", reply_markup=main_menu_kb()); return
+    city = canon_city(message.text)
     await state.update_data(from_city=city)
     await state.set_state(CalcStates.to_city)
     await message.answer("Введите <b>город прибытия</b> или выберите из списка:", parse_mode="HTML",
@@ -402,104 +364,120 @@ async def calc_to_city(message: Message, state: FSMContext):
     await state.clear()
 
 # ---- ОФОРМЛЕНИЕ ЗАКАЗА ----
-class OrderForm(StatesGroup):
-    from_city = State()
-    to_city = State()
-    date = State()
-    time_hour = State()
-    time_min = State()
-    people = State()
-    ask_comment = State()
-    comment = State()
-    confirm = State()
-
 @dp.message(F.text == "📝 Сделать заказ")
 async def order_start(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(OrderForm.from_city)
+    await state.set_state(OrderStates.from_city)
     await state.update_data(order={})
     await message.answer("Введите <b>город отправления</b> или выберите:", parse_mode="HTML",
                          reply_markup=quick_cities_kb())
 
-@dp.message(OrderForm.from_city, F.text)
+@dp.message(OrderStates.from_city, F.text)
 async def order_from_city(message: Message, state: FSMContext):
     if message.text == "⬅️ В меню":
         await state.clear(); await message.answer("Вы в главном меню:", reply_markup=main_menu_kb()); return
-    order = {"from_city": canon_city(message.text)}
+    data = await state.get_data(); order = data.get("order", {})
+    order["from_city"] = canon_city(message.text)
     await state.update_data(order=order)
-    await state.set_state(OrderForm.to_city)
+    await state.set_state(OrderStates.to_city)
     await message.answer("Введите <b>город прибытия</b> или выберите:", parse_mode="HTML",
                          reply_markup=quick_cities_kb())
 
-@dp.message(OrderForm.to_city, F.text)
+@dp.message(OrderStates.to_city, F.text)
 async def order_to_city(message: Message, state: FSMContext):
     if message.text == "⬅️ В меню":
         await state.clear(); await message.answer("Вы в главном меню:", reply_markup=main_menu_kb()); return
     data = await state.get_data(); order = data.get("order", {})
     order["to_city"] = canon_city(message.text)
     await state.update_data(order=order)
-    await state.set_state(OrderForm.date)
+    await state.set_state(OrderStates.date)
     await message.answer("Выберите <b>дату подачи</b>:", parse_mode="HTML",
                          reply_markup=calendar_kb(date.today()))
 
-@dp.callback_query(F.data.startswith("calnav:") | F.data.startswith("cal:"))
-async def calendar_callbacks(cb: CallbackQuery, state: FSMContext):
-    if cb.data.startswith("calnav:"):
-        y, m = cb.data.split(":")[1].split("-")
-        kb = calendar_kb(date(int(y), int(m), 1))
-        await cb.message.edit_reply_markup(kb)
-        await cb.answer(); return
-    if cb.data.startswith("cal:"):
-        _, iso = cb.data.split(":")
-        await state.update_data(order={(await state.get_data()).get("order", {})} or (await state.get_data()).get("order", {}))
-        data = await state.get_data(); order = data.get("order", {})
-        order["date"] = iso
-        await state.update_data(order=order)
-        await state.set_state(OrderForm.time_hour)
-        await cb.message.answer("Выберите <b>время подачи</b> — сначала <b>час</b>:", parse_mode="HTML",
-                                reply_markup=time_hour_kb())
-        await cb.answer()
+# --- Календарь: заглушка на не-кликабельные кнопки ---
+@dp.callback_query(F.data == "noop")
+async def noop_cb(cb: CallbackQuery):
+    await cb.answer()
 
+# --- Календарь: навигация по месяцам ---
+@dp.callback_query(F.data.startswith("calnav:"))
+async def calendar_nav_cb(cb: CallbackQuery):
+    # Безопасный парсер: calnav:YYYY-MM
+    payload = cb.data.split(":", 1)[1] if ":" in cb.data else ""
+    parts = payload.split("-")
+    if len(parts) != 2:
+        await cb.answer(); return
+    try:
+        y, m = int(parts[0]), int(parts[1])
+        kb = calendar_kb(date(y, m, 1))
+        await cb.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+    await cb.answer()
+
+# --- Календарь: выбор даты ---
+@dp.callback_query(F.data.startswith("cal:"))
+async def calendar_pick_cb(cb: CallbackQuery, state: FSMContext):
+    # Формат: cal:YYYY-MM-DD
+    payload = cb.data.split(":", 1)[1] if ":" in cb.data else ""
+    try:
+        chosen = date.fromisoformat(payload)
+    except Exception:
+        await cb.answer(); return
+
+    data = await state.get_data(); order = data.get("order", {})
+    order["date"] = chosen.isoformat()
+    await state.update_data(order=order)
+
+    await state.set_state(OrderStates.time_hour)
+    await cb.message.answer("Выберите <b>время подачи</b> — сначала <b>час</b>:", parse_mode="HTML",
+                            reply_markup=time_hour_kb())
+    await cb.answer()
+
+# --- Время: час ---
 @dp.callback_query(F.data.startswith("th:"))
 async def time_pick_hour(cb: CallbackQuery, state: FSMContext):
-    hour = cb.data.split(":")[1]
-    await state.set_state(OrderForm.time_min)
+    hour = cb.data.split(":", 1)[1]
+    await state.set_state(OrderStates.time_min)
     await cb.message.answer("Теперь выберите <b>минуты</b>:", parse_mode="HTML",
                             reply_markup=time_min_kb(hour))
     await cb.answer()
 
+# --- Время: минуты ---
 @dp.callback_query(F.data.startswith("tm:"))
 async def time_pick_min(cb: CallbackQuery, state: FSMContext):
     _, hour, minute = cb.data.split(":")
     data = await state.get_data(); order = data.get("order", {})
     order["time"] = f"{hour}:{minute}"
     await state.update_data(order=order)
-    await state.set_state(OrderForm.people)
+    await state.set_state(OrderStates.people)
     await cb.message.answer("Укажите <b>количество человек</b>:", parse_mode="HTML",
                             reply_markup=people_kb())
     await cb.answer()
 
+# --- Пассажиры ---
 @dp.callback_query(F.data.startswith("ppl:"))
 async def pick_people(cb: CallbackQuery, state: FSMContext):
-    people = cb.data.split(":")[1]
+    people = cb.data.split(":", 1)[1]
     data = await state.get_data(); order = data.get("order", {})
     order["people"] = people
     await state.update_data(order=order)
-    await state.set_state(OrderForm.ask_comment)
+    await state.set_state(OrderStates.ask_comment)
     await cb.message.answer("Хотите оставить комментарий к заказу?", reply_markup=yes_no_kb("cmt"))
     await cb.answer()
 
+# --- Комментарий? ---
 @dp.callback_query(F.data.startswith("cmt:"))
 async def ask_comment_cb(cb: CallbackQuery, state: FSMContext):
-    ans = cb.data.split(":")[1]
+    ans = cb.data.split(":", 1)[1]
     if ans == "yes":
-        await state.set_state(OrderForm.comment)
+        await state.set_state(OrderStates.comment)
         await cb.message.answer("Введите комментарий:")
     else:
         await proceed_to_confirm(cb.message, state)
     await cb.answer()
 
-@dp.message(OrderForm.comment, F.text)
+@dp.message(OrderStates.comment, F.text)
 async def order_comment(message: Message, state: FSMContext):
     data = await state.get_data(); order = data.get("order", {})
     comment = message.text.strip()
@@ -507,9 +485,8 @@ async def order_comment(message: Message, state: FSMContext):
     await state.update_data(order=order)
     await proceed_to_confirm(message, state)
 
-async def proceed_to_confirm(message_or_cbmsg, state: FSMContext):
+async def proceed_to_confirm(msg: Message, state: FSMContext):
     data = await state.get_data(); order = data.get("order", {})
-    # Оценим стоимость
     prices = await estimate_prices(order["from_city"], order["to_city"])
     price_txt = prices_text(prices) if prices else "Предварительную стоимость сейчас посчитать не удалось."
 
@@ -524,9 +501,10 @@ async def proceed_to_confirm(message_or_cbmsg, state: FSMContext):
         f"Комментарий: {order.get('comment') or '—'}\n\n"
         "Подтвердить?"
     )
-    await state.set_state(OrderForm.confirm)
-    await message_or_cbmsg.answer(txt, parse_mode="HTML", reply_markup=confirm_order_kb())
+    await state.set_state(OrderStates.confirm)
+    await msg.answer(txt, parse_mode="HTML", reply_markup=confirm_order_kb())
 
+# --- Завершение ---
 @dp.callback_query(F.data.in_(["order_confirm", "order_edit", "order_cancel"]))
 async def order_finish(cb: CallbackQuery, state: FSMContext):
     action = cb.data
@@ -537,10 +515,8 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
         await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
         return
     if action == "order_edit":
-        data = await state.get_data(); order = data.get("order", {})
-        await state.clear()
         await cb.message.edit_text("Изменим заказ. Введите снова город отправления:")
-        await state.set_state(OrderForm.from_city)
+        await state.set_state(OrderStates.from_city)
         await cb.answer()
         return
 
