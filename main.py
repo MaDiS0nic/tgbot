@@ -312,6 +312,30 @@ def date_calendar_kb(y: int, m: int) -> InlineKeyboardMarkup:
     ]]
     return InlineKeyboardMarkup(inline_keyboard=header + rows + nav)
 
+# ================== ВРЕМЯ (inline: сначала час, потом минуты) ==================
+def time_hours_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for base in range(0, 24, 6):
+        row = []
+        for h in range(base, base + 6):
+            row.append(InlineKeyboardButton(text=f"{h:02d}", callback_data=f"timeh:{h:02d}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="timecancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def time_minutes_kb(hour: str) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(text="00", callback_data=f"timem:{hour}:00"),
+        InlineKeyboardButton(text="15", callback_data=f"timem:{hour}:15"),
+        InlineKeyboardButton(text="30", callback_data=f"timem:{hour}:30"),
+        InlineKeyboardButton(text="45", callback_data=f"timem:{hour}:45"),
+    ]
+    ctrl = [
+        InlineKeyboardButton(text="⬅️ Часы", callback_data="timeback"),
+        InlineKeyboardButton(text="Отмена", callback_data="timecancel"),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Часы: {hour}", callback_data="noop")], row, ctrl])
+
 # ================== ПАССАЖИРЫ (inline выбор количества) ==================
 def pax_kb() -> InlineKeyboardMarkup:
     rows = [
@@ -330,6 +354,13 @@ def pax_kb() -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# ================== КОММЕНТАРИЙ? (Да/Нет) ==================
+def comment_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Да", callback_data="comment_yes"),
+        InlineKeyboardButton(text="Нет", callback_data="comment_no"),
+    ]])
 
 # ================== КЛАВИАТУРЫ ОСНОВНОГО МЕНЮ ==================
 def start_big_button_kb() -> ReplyKeyboardMarkup:
@@ -381,7 +412,8 @@ class OrderForm(StatesGroup):
     to_city = State()
     date = State()
     time = State()
-    pax = State()      # количество пассажиров
+    pax = State()
+    comment_choice = State()
     phone = State()
     comment = State()
     confirm = State()
@@ -412,7 +444,6 @@ async def geocode_city(session: aiohttp.ClientSession, city: str) -> Optional[Di
         return None
 
 def prices_text_total_only(econom: int, camry: int, minivan: int) -> str:
-    # <-- ИСПРАВЛЕНО: TARIFFS (без кириллической буквы)
     return (
         f"💰 Стоимость:\n"
         f"• {TARIFFS['econom']['title']} — ~{econom} ₽\n"
@@ -426,6 +457,24 @@ def per_km_prices(distance_km: float) -> Tuple[int, int, int]:
     p_c = int(round(d * TARIFFS["camry"]["per_km"]))
     p_m = int(round(d * TARIFFS["minivan"]["per_km"]))
     return p_e, p_c, p_m
+
+async def compute_prices_for_order(from_city: str, to_city: str) -> Optional[Tuple[int, int, int, str]]:
+    """Возвращает (e,c,m, 'fixed'|'distance') или None, если геокодинг не удался."""
+    from_key = _norm_key(from_city)
+    to_key = resolve_dest_key(to_city)
+    if from_key == "минеральные воды" and to_key in FIXED_PRICES:
+        e, c, m = FIXED_PRICES[to_key]
+        return e, c, m, "fixed"
+
+    # по расстоянию
+    async with aiohttp.ClientSession() as session:
+        a = await geocode_city(session, from_city)
+        b = await geocode_city(session, to_city)
+    if not a or not b:
+        return None
+    dist = haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
+    e, c, m = per_km_prices(dist)
+    return e, c, m, "distance"
 
 PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{8,}$")
 
@@ -609,7 +658,7 @@ async def dest_pick(cb: CallbackQuery, state: FSMContext):
 async def cal_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.delete()
     await cb.answer("Выбор даты отменён")
-    await bot.send_message(cb.message.chat.id, "Введите *дату подачи* (например, 31.10.2025):", parse_mode="Markdown")
+    await bot.send_message(cb.message.chat.id, "Выберите *дату подачи*:", parse_mode="Markdown")
     await state.set_state(OrderForm.date)
 
 @dp.callback_query(F.data.startswith("calnav:"))
@@ -636,9 +685,52 @@ async def cal_pick(cb: CallbackQuery, state: FSMContext):
     await state.update_data(order=order)
 
     await cb.message.edit_text(f"Дата подачи: *{order['date']}* ✅", parse_mode="Markdown")
-    await bot.send_message(cb.message.chat.id, "Введите *время подачи* (например, 14:30):", parse_mode="Markdown")
+    # Переход на выбор времени (часы)
+    await bot.send_message(cb.message.chat.id, "Выберите *время подачи* — сначала выберите час:", parse_mode="Markdown", reply_markup=time_hours_kb())
     await state.set_state(OrderForm.time)
     await cb.answer("Дата выбрана")
+
+# ---- ВРЕМЯ: обработчики ----
+@dp.callback_query(F.data == "timecancel")
+async def time_cancel(cb: CallbackQuery, state: FSMContext):
+    await cb.message.delete()
+    await cb.answer("Выбор времени отменён")
+    await bot.send_message(cb.message.chat.id, "Выберите *время подачи* (сначала час):", parse_mode="Markdown", reply_markup=time_hours_kb())
+    await state.set_state(OrderForm.time)
+
+@dp.callback_query(F.data == "timeback")
+async def time_back(cb: CallbackQuery, state: FSMContext):
+    try:
+        await cb.message.edit_text("Выберите *время подачи* — сначала выберите час:", parse_mode="Markdown")
+    except Exception:
+        pass
+    await cb.message.answer("Часы:", reply_markup=time_hours_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("timeh:"))
+async def time_pick_hour(cb: CallbackQuery, state: FSMContext):
+    hour = cb.data.split(":", 1)[1]
+    try:
+        await cb.message.edit_text(f"Час: *{hour}* — теперь выберите минуты:", parse_mode="Markdown")
+    except Exception:
+        pass
+    await cb.message.answer("Минуты:", reply_markup=time_minutes_kb(hour))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("timem:"))
+async def time_pick_minutes(cb: CallbackQuery, state: FSMContext):
+    _, hour, minute = cb.data.split(":")
+    tm = f"{hour}:{minute}"
+    data = await state.get_data()
+    order = data.get("order", {})
+    order["time"] = tm
+    await state.update_data(order=order)
+
+    await cb.message.edit_text(f"Время подачи: *{order['time']}* ✅", parse_mode="Markdown")
+    # дальше — выбор пассажиров
+    await bot.send_message(cb.message.chat.id, "Укажите *количество человек*:", parse_mode="Markdown", reply_markup=pax_kb())
+    await state.set_state(OrderForm.pax)
+    await cb.answer("Время выбрано")
 
 # ---- КАЛЬКУЛЯТОР (ручной ввод) ----
 async def geocode_pair(from_city: str, to_city: str) -> Optional[Tuple[Dict[str, float], Dict[str, float]]]:
@@ -699,7 +791,7 @@ async def calc_to_city(message: Message, state: FSMContext):
         await message.answer("Произошла ошибка при расчёте. Попробуйте ещё раз.", reply_markup=main_menu_kb())
         await state.clear()
 
-# ---- СДЕЛАТЬ ЗАКАЗ (ручной ввод + календарь для даты + выбор пассажиров) ----
+# ---- СДЕЛАТЬ ЗАКАЗ (ручной ввод + календарь + время + пассажиры + комментарий по выбору) ----
 @dp.message(OrderForm.from_city, F.text)
 async def order_from_city(message: Message, state: FSMContext):
     order = {"from_city": resolve_from_city(message.text)}
@@ -725,15 +817,14 @@ async def order_date_text_fallback(message: Message, state: FSMContext):
     order["date"] = normalize_city(message.text)
     await state.update_data(order=order)
     await state.set_state(OrderForm.time)
-    await message.answer("Введите *время подачи* (например, 14:30):", parse_mode="Markdown")
+    await message.answer("Выберите *время подачи* — сначала выберите час:", parse_mode="Markdown", reply_markup=time_hours_kb())
 
 @dp.message(OrderForm.time, F.text)
-async def order_time(message: Message, state: FSMContext):
+async def order_time_text_fallback(message: Message, state: FSMContext):
+    # Если вдруг пользователь ввёл время текстом — принимаем как есть и идём на пассажиров
     order = (await state.get_data()).get("order", {})
     order["time"] = normalize_city(message.text)
     await state.update_data(order=order)
-
-    # Новый шаг: выбор количества пассажиров
     await state.set_state(OrderForm.pax)
     await message.answer("Укажите *количество человек*:", parse_mode="Markdown", reply_markup=pax_kb())
 
@@ -746,13 +837,13 @@ async def pax_pick(cb: CallbackQuery, state: FSMContext):
     await state.update_data(order=order)
 
     await cb.message.edit_text(f"Пассажиров: *{order['pax']}* ✅", parse_mode="Markdown")
-    await bot.send_message(cb.message.chat.id, "Введите *номер телефона* (+7 ...):", parse_mode="Markdown")
-    await state.set_state(OrderForm.phone)
+    # Комментарий? (Да/Нет)
+    await bot.send_message(cb.message.chat.id, "Хотите оставить комментарий к заказу?", reply_markup=comment_choice_kb())
+    await state.set_state(OrderForm.comment_choice)
     await cb.answer("Количество пассажиров указано")
 
 @dp.message(OrderForm.pax, F.text)
 async def pax_text_fallback(message: Message, state: FSMContext):
-    """Если пользователь всё же ввёл число текстом."""
     raw = message.text.strip().lower()
     mapped = None
     if raw in {"1","2","3","4","5","6"}:
@@ -766,6 +857,33 @@ async def pax_text_fallback(message: Message, state: FSMContext):
     order = (await state.get_data()).get("order", {})
     order["pax"] = mapped
     await state.update_data(order=order)
+    await state.set_state(OrderForm.comment_choice)
+    await message.answer("Хотите оставить комментарий к заказу?", reply_markup=comment_choice_kb())
+
+# ---- КОММЕНТАРИЙ? Да/Нет ----
+@dp.callback_query(F.data == "comment_yes")
+async def comment_yes(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("Оставьте комментарий к заказу (или «-», если передумали):")
+    await state.set_state(OrderForm.comment)
+    await cb.answer()
+
+@dp.callback_query(F.data == "comment_no")
+async def comment_no(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data(); order = data.get("order", {})
+    order["comment"] = ""
+    await state.update_data(order=order)
+    await cb.answer("Без комментария")
+    # Переходим к вводу телефона
+    await bot.send_message(cb.message.chat.id, "Введите *номер телефона* (+7 ...):", parse_mode="Markdown")
+    await state.set_state(OrderForm.phone)
+
+@dp.message(OrderForm.comment, F.text)
+async def order_comment(message: Message, state: FSMContext):
+    data = await state.get_data(); order = data.get("order", {})
+    comment = message.text.strip()
+    order["comment"] = "" if comment == "-" else comment
+    await state.update_data(order=order)
+    # Далее — телефон
     await state.set_state(OrderForm.phone)
     await message.answer("Введите *номер телефона* (+7 ...):", parse_mode="Markdown")
 
@@ -778,15 +896,15 @@ async def order_phone(message: Message, state: FSMContext):
     data = await state.get_data(); order = data.get("order", {})
     order["phone"] = phone
     await state.update_data(order=order)
-    await state.set_state(OrderForm.comment)
-    await message.answer("Комментарий к заказу (если нет — напишите «-»):", parse_mode="Markdown")
 
-@dp.message(OrderForm.comment, F.text)
-async def order_comment(message: Message, state: FSMContext):
-    data = await state.get_data(); order = data.get("order", {})
-    comment = message.text.strip()
-    order["comment"] = "" if comment == "-" else comment
-    await state.update_data(order=order)
+    # Считаем ориентировочную стоимость
+    prices = await compute_prices_for_order(order.get("from_city",""), order.get("to_city",""))
+    if prices is None:
+        price_block = "💰 Стоимость: не удалось ориентировочно рассчитать (уточнит диспетчер)."
+    else:
+        e, c, m, mode = prices
+        price_block = prices_text_total_only(e, c, m)
+
     txt = (
         f"Проверьте данные заказа:\n\n"
         f"Откуда: *{order.get('from_city','')}*\n"
@@ -796,6 +914,8 @@ async def order_comment(message: Message, state: FSMContext):
         f"Пассажиров: *{order.get('pax','')}*\n"
         f"Телефон: *{order.get('phone','')}*\n"
         f"Комментарий: {order.get('comment') or '—'}\n\n"
+        "⚠️ *Стоимость предварительная, окончательная цена оговаривается с диспетчером!*\n\n"
+        f"{price_block}\n\n"
         "Подтвердить?"
     )
     await state.set_state(OrderForm.confirm)
@@ -824,6 +944,13 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
     await bot.send_message(cb.message.chat.id, "Вы в главном меню:", reply_markup=main_menu_kb())
     await cb.answer("Заявка отправлена")
 
+    # уведомление админу с ориент. ценой
+    price_text = ""
+    prices = await compute_prices_for_order(order.get("from_city",""), order.get("to_city",""))
+    if prices is not None:
+        e, c, m, _ = prices
+        price_text = "\n\nОриентировочно:\n" + prices_text_total_only(e, c, m)
+
     if ADMIN_CHAT_ID:
         try:
             user = cb.from_user
@@ -833,7 +960,8 @@ async def order_finish(cb: CallbackQuery, state: FSMContext):
                 f"Дата: *{order.get('date','')}*, Время: *{order.get('time','')}*\n"
                 f"Пассажиров: *{order.get('pax','')}*\n"
                 f"Телефон: *{order.get('phone','')}*\n"
-                f"Комментарий: {order.get('comment') or '—'}\n\n"
+                f"Комментарий: {order.get('comment') or '—'}"
+                f"{price_text}\n\n"
                 f"👤 {user.full_name} (id={user.id})"
             )
             await bot.send_message(ADMIN_CHAT_ID, txt, parse_mode="Markdown")
