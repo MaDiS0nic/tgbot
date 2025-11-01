@@ -39,7 +39,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ================== ЛЕЙБЛЫ КНОПОК ==================
-BTN_START = "▶️ Старт"
 BTN_CALC = "🧮 Калькулятор стоимости"
 BTN_ORDER = "📝 Сделать заказ"
 BTN_DISPATCHER = "☎️ Диспетчер"
@@ -377,14 +376,7 @@ def comment_choice_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Нет", callback_data="comment_no"),
     ]])
 
-# ================== КЛАВИАТУРЫ ОСНОВНОГО МЕНЮ ==================
-def start_big_button_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_START)]],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
+# ================== КЛАВИАТУРА ГЛАВНОГО МЕНЮ ==================
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -531,19 +523,7 @@ async def menu_router(message: Message, state: FSMContext):
 # ================== START ==================
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    text = (
-        " \n"
-        "*Здравствуйте!* \n"
-        "Это бот междугороднего такси \n"
-        "*TransferAir Кавказские Минеральные Воды*.\n"
-        " \n"
-        "Нажмите *Старт*, чтобы продолжить."
-    )
-    await message.answer(text, parse_mode="Markdown", reply_markup=start_big_button_kb())
-
-@dp.message(F.text == BTN_START)
-async def on_big_start(message: Message, state: FSMContext):
+    # Без приветствия и без кнопки «Старт». Сразу показываем главное меню.
     await state.clear()
     await message.answer("Выберите действие:", reply_markup=main_menu_kb())
 
@@ -559,7 +539,7 @@ async def on_dispatcher(message: Message):
 
 @dp.callback_query(F.data == "dispatcher_phone")
 async def dispatcher_phone_cb(cb: CallbackQuery):
-    # Просто текст с номером, чтобы Telegram сделал его кликабельным (как в «Информация»)
+    # Просто текст с номером — Telegram делает его кликабельным
     await cb.message.answer(f"📞 Телефон диспетчера: {DISPATCHER_PHONE}\nНажмите на номер, чтобы позвонить.")
     await cb.answer("Номер отправлен")
 
